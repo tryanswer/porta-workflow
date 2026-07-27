@@ -7,6 +7,8 @@ import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 
 const clientPath = fileURLToPath(new URL('../scripts/porta-workflow.mjs', import.meta.url))
+const referencePath = fileURLToPath(new URL('../references/bridge-workflow-v1.md', import.meta.url))
+const skillPath = fileURLToPath(new URL('../SKILL.md', import.meta.url))
 const realBridgeSource = process.env.PORTA_WORKFLOW_TEST_BRIDGE_SOURCE
 
 async function createFixture() {
@@ -161,7 +163,7 @@ test('begin persists exact Bridge identity and replays locally without a duplica
   const fixture = await createFixture()
   try {
     const { key, result } = await beginRun(fixture)
-    assert.equal(result.receipt.skillVersion, '0.1.0')
+    assert.equal(result.receipt.skillVersion, '0.1.1')
     assert.equal(result.receipt.workRunId, 'workrun_33333333-3333-4333-8333-333333333333')
     const replay = parseSuccess(run(fixture, ['begin', '--run-key', key, '--provider', 'codex']))
     assert.equal(replay.cached, true)
@@ -182,6 +184,18 @@ test('begin persists exact Bridge identity and replays locally without a duplica
   } finally {
     await fixture.cleanup()
   }
+})
+
+test('Web Ready contract requires process durability beyond the Agent session', async () => {
+  const [skill, reference] = await Promise.all([
+    readFile(skillPath, 'utf8'),
+    readFile(referencePath, 'utf8'),
+  ])
+  assert.match(skill, /durable process that can outlive the current Agent command\/session/u)
+  assert.match(skill, /transient command runner is not Ready evidence/u)
+  assert.match(reference, /survives the transient Agent command\/session/u)
+  assert.match(reference, /temporary tool session, or immediate probe alone is insufficient/u)
+  assert.match(reference, /preview_process_failed/u)
 })
 
 test('manifest injects Bridge identities and ready uses the exact WorkRun', async () => {

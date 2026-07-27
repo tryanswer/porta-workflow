@@ -23,7 +23,7 @@ Complete the user's project task and publish its verified Web or Android APK res
 4. Inspect the repository and choose the smallest project-native implementation, verification, build, and process-lifecycle approach. Do not impose a framework, package manager, port, or build command.
 5. Emit bounded progress at meaningful phase changes. Use `attention` only when user input is genuinely required; keep the full question in the terminal conversation.
 6. Call `preview-start` only when artifact preparation actually begins. Write build output to the exact returned log path and create manifests only through the bundled client.
-7. Publish `preview-ready` only after a Web endpoint is live and probed or an APK is freshly built, hashed, and identified. On failure or unsupported output, write the matching terminal manifest before calling `fail`.
+7. Publish `preview-ready` only after a Web endpoint is live, probed, and owned by a durable process that can outlive the current Agent command/session, or an APK is freshly built, hashed, and identified. On failure or unsupported output, write the matching terminal manifest before calling `fail`.
 8. On an explicit stop, stop only the exact WorkRun and only processes proven to belong to this invocation. Never target a recent or same-project Preview by guesswork.
 
 ## Hard boundaries
@@ -32,6 +32,7 @@ Complete the user's project task and publish its verified Web or Android APK res
 - Reuse an operation key only for an exact retry. Use a new operation key for a new progress or attention update.
 - Never send secrets, prompts, transcripts, command output, environment values, project paths, manifest content, or artifact content as event fields.
 - Never send Ready for a stale file, dead server, failed build, unsupported artifact, or merely generated source.
+- A Web listener owned only by a transient command runner is not Ready evidence. If the runtime cannot retain a verified, stoppable process after the Agent exits, publish Failed instead.
 - Never commit `.porta/` runtime files unless the user's repository explicitly owns them.
 - If Bridge rejects a transition, preserve the exact Run key and receipt, fix the underlying condition, and retry only when the command remains semantically valid.
 

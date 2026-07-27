@@ -39,7 +39,7 @@ node "$CLIENT" begin \
 3. Inspect and implement using the repository's own architecture and commands.
 4. Emit progress only at meaningful phase changes.
 5. Start Preview monitoring when artifact preparation begins.
-6. Produce and independently verify a Web or Android APK artifact.
+6. Produce and independently verify a Web or Android APK artifact. A Web process must use a project- or host-supported lifecycle that survives the transient Agent command/session.
 7. Write an exact terminal manifest.
 8. Send Ready, Failed, Unsupported, or Stop through the same WorkRun.
 
@@ -98,7 +98,7 @@ Web Ready example:
 }
 ```
 
-Web requires `id`, `name`, `type`, `scheme`, `remoteHost`, `remotePort`, and `path`; `framework` is optional. Bind a development or preview server to `127.0.0.1` when the project supports it, retain the owning process, and probe the actual endpoint before Ready.
+Web requires `id`, `name`, `type`, `scheme`, `remoteHost`, `remotePort`, and `path`; `framework` is optional. Bind a development or preview server to `127.0.0.1` when the project supports it. Choose the repository's or host's existing durable process-lifecycle mechanism, retain exact ownership evidence locally, let the launch command return, then verify the owning process and probe the actual endpoint before Ready. A server still owned by a transient Agent tool session is not durable evidence even when it currently returns HTTP 200.
 
 Android APK requires these artifact fields:
 
@@ -129,7 +129,7 @@ The optional `runner` object may contain `type`, `hostId`, `startedAt`, and `fin
 
 Choose build and verification commands from the repository, not from this skill.
 
-- Web: prove the owning process is still alive, use its actual bound host/port, and probe the exact path. A printed URL alone is insufficient.
+- Web: prove the owning process is still alive independently of the launch command and current Agent session, use its actual bound host/port, and probe the exact path. Prefer an existing project process manager or host session mechanism; use a generic detached process only when its ownership and stop path are exact. A printed URL, temporary tool session, or immediate probe alone is insufficient.
 - Android APK: require a successful project-native build, a fresh non-empty APK, a computed SHA-256, and verified package identity. Never reuse an older APK merely because it exists.
 - Unsupported: if the project cannot produce Web or Android APK output, write `unsupported` and call `fail --outcome unsupported`; do not relabel source files or another artifact type as Ready.
 
@@ -143,6 +143,7 @@ Write complete command output to the Bridge-issued `logPath` using the project's
 - `preview_busy`: keep the current WorkRun and operation key. Ask the user to stop the existing Preview in Porta, then retry; never replace it by cwd or recency.
 - `manifest_missing` or `manifest_invalid`: fix the exact manifest, then retry the same Ready/Fail command.
 - `work_run_not_found`: the retained WorkRun has expired or disappeared. Report that fact; create a new Run key only if the user still explicitly requests a new Workflow.
+- Preview process cannot survive Agent exit: write a failed manifest and call `fail --outcome failed --reason-code preview_process_failed`. Do not emit Ready for a listener that will be reclaimed with the current tool session.
 - User stop: call `stop` for the exact Run key. Interrupt a process only when this invocation recorded its exact ownership; otherwise report that monitoring stopped without claiming the process exited.
 - Failed/unsupported terminal: write the matching terminal manifest first. If the manifest cannot be written or validated, report that the terminal event was not accepted.
 

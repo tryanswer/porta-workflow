@@ -11,7 +11,7 @@ The normal path is to send Porta's built-in Porta Workflow installation scene to
 For manual inspection, clone the fixed release before using the Agent's native user-level mechanism:
 
 ```bash
-git clone --branch porta-workflow-v0.1.0 --single-branch https://github.com/tryanswer/porta-workflow.git
+git clone --branch porta-workflow-v0.1.1 --single-branch https://github.com/tryanswer/porta-workflow.git
 cd porta-workflow
 git rev-parse HEAD
 ```
