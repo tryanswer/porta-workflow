@@ -1,0 +1,7 @@
+interface:
+  display_name: "Porta Workflow"
+  short_description: "Run verified Porta product-preview workflows"
+  default_prompt: "Use $porta-workflow to build this project and publish a verified preview to Porta."
+
+policy:
+  allow_implicit_invocation: false
