@@ -154,8 +154,13 @@ test('Scene installation uses the bundled recoverable transaction without becomi
 
   assert.match(normalizedSkill, /run the bundled activation transaction directly without activating this Skill/)
   assert.match(normalizedSkill, /do not call a Provider-native overwrite\/update command/)
+  assert.match(normalizedSkill, /exact approved source release before update or rollback/)
   assert.match(normalizedSkill, /Installation or update success is not Provider discovery/)
   assert.match(normalizedReference, /exact annotated release tag and full 40-character commit SHA/)
+  assert.match(normalizedReference, /helper release, transition intent, source release, and target release/)
+  assert.match(normalizedReference, /Fresh install requires the destination to be absent/)
+  assert.match(normalizedReference, /update or rollback requires the active tree to match the exact approved source tag and full SHA/)
+  assert.match(normalizedReference, /newer helper checkout may activate an older approved target during rollback/)
   assert.match(normalizedReference, /reads file bytes from the exact Git commit object rather than from mutable worktree paths/)
   assert.match(normalizedReference, /failure after the previous tree is retired restores that exact backup/)
   assert.match(normalizedReference, /next invocation first claims the dead transaction/)

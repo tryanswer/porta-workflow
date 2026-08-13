@@ -16,7 +16,7 @@ requested legacy Web or Android APK Product Preview.
 ## Scene Pack installation and update
 
 - A Scene Pack installation Agent may run the bundled activation transaction directly without activating this Skill. Read [references/skill-activation.md](references/skill-activation.md) completely and use only the exact repository, annotated tag, full SHA, Provider, and transition supplied by the current trusted Scene prompt.
-- For an existing installation, do not call a Provider-native overwrite/update command. Run the bundled activation helper from the clean exact release checkout; it stages the complete Git subdirectory beside the user-level Provider Skill directory, journals the transition, and restores the exact previous tree after a recoverable failure. An unknown replacement or corrupt receipt fails closed and preserves recovery evidence.
+- For an existing installation, do not call a Provider-native overwrite/update command. Run the bundled activation helper from its clean exact helper-release checkout. It verifies the active tree against the exact approved source release before update or rollback, stages the complete target Git subdirectory beside the user-level Provider Skill directory, journals the transition, and restores that source tree after a recoverable failure. An absent, unknown, or replaced source and a corrupt receipt fail closed while preserving recovery evidence.
 - Installation or update success is not Provider discovery. Perform the Provider-native reload or new-session step separately, observe discovery, and only then submit the neutral readiness claim below. The activation receipt is local transaction evidence, not a WorkRun, publication authority, or Bridge attestation.
 
 ## Scene Pack readiness

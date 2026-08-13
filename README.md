@@ -18,7 +18,7 @@ git rev-parse HEAD
 
 Compare the resolved commit with the full SHA shown by Porta. Do not install from a moving branch.
 
-For an existing user-level installation, the Scene Agent must not use a Provider's overwrite behavior as the update transaction. From the clean exact release checkout it runs the bundled `porta-workflow/scripts/porta-workflow-skill-activation.mjs` helper with the catalog repository, annotated tag, full SHA, and current Provider. The helper stages the complete Git subdirectory beside the Provider Skill directory, verifies the active tree, and restores the exact prior tree if activation fails before settlement. See [`skill-activation.md`](porta-workflow/references/skill-activation.md).
+For an existing user-level installation, the Scene Agent must not use a Provider's overwrite behavior as the update transaction. From the clean exact helper-release checkout it runs the bundled `porta-workflow/scripts/porta-workflow-skill-activation.mjs` helper with the catalog repository, exact install/update/rollback intent, annotated helper/source/target tags, full SHAs, and current Provider. Fresh install requires an absent destination; update or rollback first proves the active tree is the exact approved source release. The helper stages the complete target Git subdirectory beside the Provider Skill directory and restores that source tree if activation fails before settlement. A newer helper checkout can therefore perform an approved rollback to an older target without trusting an updater bundled in that target. See [`skill-activation.md`](porta-workflow/references/skill-activation.md).
 
 - Codex: fresh install at user scope, then use a new Agent session for discovery.
 - Claude Code: install at user scope, then use its native Skill reload.

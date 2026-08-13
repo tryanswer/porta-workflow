@@ -5,6 +5,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import {
   chmod,
   lstat,
+  link,
   mkdir,
   open,
   readdir,
@@ -28,10 +29,12 @@ const MAX_FILES = 1024
 const MAX_FILE_BYTES = 4 * 1024 * 1024
 const MAX_TREE_BYTES = 16 * 1024 * 1024
 const MAX_JOURNAL_BYTES = 16 * 1024
-const TRANSACTION_VERSION = 1
+const TRANSACTION_VERSION = 2
 const tagPattern = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/
 const commitPattern = /^[0-9a-f]{40}$/
 const gitObjectPattern = /^[0-9a-f]{40,64}$/
+const operationIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+const TRANSITION_INTENTS = new Set(['install', 'rollback', 'update'])
 
 class ActivationError extends Error {
   constructor(code, message) {
@@ -97,6 +100,49 @@ function requireRepositoryUrl(value) {
   return value
 }
 
+function hasExactKeys(value, expectedKeys) {
+  const actual = Object.keys(value).sort(compareStrings)
+  const expected = [...expectedKeys].sort(compareStrings)
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index])
+}
+
+function compareStrings(left, right) {
+  if (left < right) return -1
+  if (left > right) return 1
+  return 0
+}
+
+function requireReleaseEvidence(value, label) {
+  if (!isRecord(value) || !hasExactKeys(value, ['commitSha', 'tag'])) {
+    fail('invalid_transition', `${label} release evidence is invalid.`)
+  }
+  return {
+    commitSha: requireCommit(value.commitSha),
+    tag: requireSafeTag(value.tag),
+  }
+}
+
+function requireTransition(value) {
+  if (!isRecord(value) || !TRANSITION_INTENTS.has(value.intent)) {
+    fail('invalid_transition', 'Activation requires an explicit install, update, or rollback transition.')
+  }
+  if (value.intent === 'install') {
+    if (!hasExactKeys(value, ['intent', 'to'])) {
+      fail('invalid_transition', 'Install transition must declare only its exact target release.')
+    }
+    return { intent: value.intent, to: requireReleaseEvidence(value.to, 'Target') }
+  }
+  if (!hasExactKeys(value, ['from', 'intent', 'to'])) {
+    fail('invalid_transition', 'Update and rollback transitions require exact source and target releases.')
+  }
+  const from = requireReleaseEvidence(value.from, 'Source')
+  const to = requireReleaseEvidence(value.to, 'Target')
+  if (from.commitSha === to.commitSha && from.tag === to.tag) {
+    fail('invalid_transition', 'Transition source and target releases must differ.')
+  }
+  return { from, intent: value.intent, to }
+}
+
 export function resolvePortaWorkflowSkillDestination({ provider, providerHome }) {
   requireProvider(provider)
   requireAbsolutePath(providerHome, 'Provider home')
@@ -106,18 +152,37 @@ export function resolvePortaWorkflowSkillDestination({ provider, providerHome })
 function resolveDefaultProviderHome(provider, environment = process.env) {
   requireProvider(provider)
   if (provider === 'codex') {
-    return resolve(environment.CODEX_HOME || join(homedir(), '.codex'))
+    return requireAbsolutePath(environment.CODEX_HOME || join(homedir(), '.codex'), 'Codex home')
   }
   if (provider === 'claude') {
-    return resolve(environment.CLAUDE_CONFIG_DIR || join(homedir(), '.claude'))
+    return requireAbsolutePath(environment.CLAUDE_CONFIG_DIR || join(homedir(), '.claude'), 'Claude config directory')
   }
-  return resolve(join(homedir(), '.gemini'))
+  return requireAbsolutePath(join(homedir(), '.gemini'), 'Gemini home')
 }
 
 async function runGit(repository, args, options = {}) {
+  const environment = Object.fromEntries(
+    Object.entries(process.env).filter(([name]) => !name.startsWith('GIT_')),
+  )
+  Object.assign(environment, {
+    GIT_CONFIG_GLOBAL: '/dev/null',
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_NO_REPLACE_OBJECTS: '1',
+    GIT_OPTIONAL_LOCKS: '0',
+    LANG: 'C',
+    LC_ALL: 'C',
+  })
   try {
-    const result = await execFileAsync('git', ['-C', repository, ...args], {
+    const result = await execFileAsync('git', [
+      '--no-optional-locks',
+      '-c', 'core.fsmonitor=false',
+      '-c', 'core.hooksPath=/dev/null',
+      '-c', 'core.untrackedCache=false',
+      '-C', repository,
+      ...args,
+    ], {
       encoding: options.encoding ?? 'utf8',
+      env: environment,
       maxBuffer: options.maxBuffer ?? MAX_TREE_BYTES + (1024 * 1024),
       windowsHide: true,
     })
@@ -155,7 +220,7 @@ function buildDirectoryEntries(fileEntries) {
       parent = dirname(parent)
     }
   }
-  return [...paths].sort().map((path) => ({ path, type: 'directory' }))
+  return [...paths].sort(compareStrings).map((path) => ({ path, type: 'directory' }))
 }
 
 function hashTreeEntries(entries) {
@@ -172,16 +237,10 @@ function hashTreeEntries(entries) {
   return hash.digest('hex')
 }
 
-async function loadImmutableRelease({
-  expectedCommit,
-  expectedRepositoryUrl,
-  expectedTag,
-  sourceRepository,
-}) {
+async function verifySourceRepository({ expectedRepositoryUrl, helperRelease, sourceRepository }) {
   requireAbsolutePath(sourceRepository, 'Source repository')
-  requireCommit(expectedCommit)
   requireRepositoryUrl(expectedRepositoryUrl)
-  requireSafeTag(expectedTag)
+  requireReleaseEvidence(helperRelease, 'Helper')
 
   const canonicalRepository = await realpath(sourceRepository).catch(() => {
     fail('release_verification_failed', 'Source repository does not exist.')
@@ -193,24 +252,37 @@ async function loadImmutableRelease({
   if (origin !== expectedRepositoryUrl) {
     fail('release_verification_failed', 'Git origin does not match the approved repository URL.')
   }
-  const tagType = (await runGit(sourceRepository, ['cat-file', '-t', `refs/tags/${expectedTag}`])).trim()
+  const tagType = (await runGit(sourceRepository, ['cat-file', '-t', `refs/tags/${helperRelease.tag}`])).trim()
   if (tagType !== 'tag') {
-    fail('release_verification_failed', 'The approved release tag must be annotated.')
+    fail('release_verification_failed', 'The approved helper release tag must be annotated.')
   }
   const resolvedCommit = (await runGit(
     sourceRepository,
-    ['rev-parse', '--verify', `refs/tags/${expectedTag}^{commit}`],
+    ['rev-parse', '--verify', `refs/tags/${helperRelease.tag}^{commit}`],
   )).trim()
-  if (resolvedCommit !== expectedCommit) {
-    fail('release_verification_failed', 'The approved tag does not resolve to the exact commit.')
+  if (resolvedCommit !== helperRelease.commitSha) {
+    fail('release_verification_failed', 'The approved helper tag does not resolve to the exact commit.')
   }
   const checkedOutCommit = (await runGit(sourceRepository, ['rev-parse', '--verify', 'HEAD'])).trim()
   const worktreeStatus = (await runGit(
     sourceRepository,
     ['status', '--porcelain=v1', '--untracked-files=all', '--', RELEASE_SUBDIRECTORY],
   )).trim()
-  if (checkedOutCommit !== expectedCommit || worktreeStatus) {
-    fail('release_verification_failed', 'The activation helper must run from the clean exact release checkout.')
+  if (checkedOutCommit !== helperRelease.commitSha || worktreeStatus) {
+    fail('release_verification_failed', 'The activation helper must run from its clean exact release checkout.')
+  }
+}
+
+async function loadImmutableRelease({ release, sourceRepository }) {
+  const { commitSha: expectedCommit, tag: expectedTag } = requireReleaseEvidence(release, 'Release')
+  const tagType = (await runGit(sourceRepository, ['cat-file', '-t', `refs/tags/${expectedTag}`])).trim()
+  if (tagType !== 'tag') fail('release_verification_failed', 'The approved release tag must be annotated.')
+  const resolvedCommit = (await runGit(
+    sourceRepository,
+    ['rev-parse', '--verify', `refs/tags/${expectedTag}^{commit}`],
+  )).trim()
+  if (resolvedCommit !== expectedCommit) {
+    fail('release_verification_failed', 'The approved release tag does not resolve to the exact commit.')
   }
 
   const treeOutput = await runGit(
@@ -252,12 +324,12 @@ async function loadImmutableRelease({
     totalBytes += size
     files.push({ content, mode, path, type: 'file' })
   }
-  files.sort((left, right) => left.path.localeCompare(right.path))
+  files.sort((left, right) => compareStrings(left.path, right.path))
   if (!files.some((entry) => entry.path === 'SKILL.md')) {
     fail('release_verification_failed', 'The release does not contain SKILL.md.')
   }
   const entries = [...buildDirectoryEntries(files), ...files].sort((left, right) => (
-    left.path.localeCompare(right.path) || left.type.localeCompare(right.type)
+    compareStrings(left.path, right.path) || compareStrings(left.type, right.type)
   ))
   const portablePaths = new Set()
   for (const entry of entries) {
@@ -339,11 +411,11 @@ async function publishJson(path, value) {
   }
 }
 
-async function readBoundedJson(path) {
+async function readBoundedJsonReceipt(path) {
   const descriptor = await open(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0))
   try {
     const before = await descriptor.stat({ bigint: true })
-    if (!before.isFile() || before.size < 2n || before.size > BigInt(MAX_JOURNAL_BYTES)) {
+    if (!before.isFile() || before.nlink !== 1n || before.size < 2n || before.size > BigInt(MAX_JOURNAL_BYTES)) {
       fail('transaction_corrupt', 'Activation state is malformed.')
     }
     const bytes = await descriptor.readFile()
@@ -355,13 +427,141 @@ async function readBoundedJson(path) {
       || before.mtimeNs !== after.mtimeNs
       || before.ctimeNs !== after.ctimeNs
     ) fail('filesystem_changed', 'Activation state changed during readback.')
-    return JSON.parse(bytes.toString('utf8'))
+    return {
+      identity: { dev: before.dev, ino: before.ino },
+      value: JSON.parse(bytes.toString('utf8')),
+    }
   } catch (error) {
     if (error instanceof ActivationError) throw error
     fail('transaction_corrupt', 'Activation state is not valid JSON.')
   } finally {
     await descriptor.close()
   }
+}
+
+async function readBoundedJson(path) {
+  return (await readBoundedJsonReceipt(path)).value
+}
+
+function requireOwner(value, label) {
+  if (
+    !isRecord(value)
+    || !hasExactKeys(value, ['pid', 'startedAt', 'token', 'version'])
+    || value.version !== 1
+    || !Number.isSafeInteger(value.pid)
+    || value.pid < 1
+    || !operationIdPattern.test(value.token)
+    || typeof value.startedAt !== 'string'
+    || Number.isNaN(Date.parse(value.startedAt))
+    || new Date(value.startedAt).toISOString() !== value.startedAt
+  ) fail('transaction_corrupt', `${label} owner receipt is invalid.`)
+  return value
+}
+
+async function createOwnedJson(path, owner, parent) {
+  const descriptor = await open(
+    path,
+    fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW ?? 0),
+    0o600,
+  )
+  let identity
+  let closed = false
+  try {
+    const initial = await descriptor.stat({ bigint: true })
+    if (!initial.isFile() || initial.nlink !== 1n || initial.size !== 0n) {
+      fail('filesystem_changed', 'Activation owner file was not created exclusively.')
+    }
+    identity = { dev: initial.dev, ino: initial.ino }
+    await writeDescriptorJson(descriptor, owner)
+    const stat = await descriptor.stat({ bigint: true })
+    if (!stat.isFile() || stat.nlink !== 1n || !sameIdentity(identity, stat)) {
+      fail('filesystem_changed', 'Activation owner file is unsafe.')
+    }
+    await descriptor.close()
+    closed = true
+    await fsyncDirectory(parent)
+    return { identity, owner, path }
+  } catch (error) {
+    if (!closed) await descriptor.close().catch(() => {})
+    if (identity) {
+      try {
+        await removeFileByIdentity(path, identity, 'incomplete-owner', parent)
+      } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], 'Activation owner publication failed and exact cleanup is required.')
+      }
+    }
+    throw error
+  }
+}
+
+async function readOwnedJson(path, label) {
+  const receipt = await readBoundedJsonReceipt(path)
+  return {
+    identity: receipt.identity,
+    owner: requireOwner(receipt.value, label),
+    path,
+  }
+}
+
+function sameIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino
+}
+
+async function restoreQuarantinedUnknown(quarantine, path, parent) {
+  try {
+    await link(quarantine, path)
+    await unlink(quarantine)
+    await fsyncDirectory(parent)
+  } catch {
+    fail('filesystem_changed', 'Unknown activation ownership evidence was preserved for explicit recovery.')
+  }
+}
+
+async function removeFileByIdentity(path, identity, label, parent) {
+  const quarantine = `${path}.${label}-${randomUUID()}`
+  await rename(path, quarantine)
+  await fsyncDirectory(parent)
+  const descriptor = await open(quarantine, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0))
+  let observed
+  try {
+    observed = await descriptor.stat({ bigint: true })
+  } finally {
+    await descriptor.close()
+  }
+  if (!observed.isFile() || observed.nlink !== 1n || !sameIdentity(observed, identity)) {
+    await restoreQuarantinedUnknown(quarantine, path, parent)
+    fail('filesystem_changed', `${label} ownership changed before cleanup.`)
+  }
+  await unlink(quarantine)
+  await fsyncDirectory(parent)
+}
+
+async function removeOwnedJson(receipt, label, parent) {
+  const quarantine = `${receipt.path}.${label}-${randomUUID()}`
+  try {
+    await rename(receipt.path, quarantine)
+  } catch (error) {
+    if (error?.code === 'ENOENT') fail('filesystem_changed', `${label} ownership disappeared before settlement.`)
+    throw error
+  }
+  await fsyncDirectory(parent)
+  let observed
+  try {
+    observed = await readOwnedJson(quarantine, label)
+  } catch (error) {
+    await restoreQuarantinedUnknown(quarantine, receipt.path, parent)
+    throw error
+  }
+  if (
+    !sameIdentity(observed.identity, receipt.identity)
+    || observed.owner.token !== receipt.owner.token
+    || observed.owner.pid !== receipt.owner.pid
+  ) {
+    await restoreQuarantinedUnknown(quarantine, receipt.path, parent)
+    fail('filesystem_changed', `${label} ownership changed before settlement.`)
+  }
+  await unlink(quarantine)
+  await fsyncDirectory(parent)
 }
 
 function processIsAlive(pid) {
@@ -378,50 +578,42 @@ async function acquireTransactionLock(parent) {
   const paths = transactionPaths(parent, 'pending')
   const owner = { pid: process.pid, startedAt: new Date().toISOString(), token: randomUUID(), version: 1 }
   const tryCreate = async () => {
-    const descriptor = await open(
-      paths.lock,
-      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW ?? 0),
-      0o600,
-    )
-    try {
-      await writeDescriptorJson(descriptor, owner)
-    } finally {
-      await descriptor.close()
-    }
-    await fsyncDirectory(parent)
+    return createOwnedJson(paths.lock, owner, parent)
   }
   try {
-    await tryCreate()
-    return paths.lock
+    return await tryCreate()
   } catch (error) {
     if (error?.code !== 'EEXIST') throw error
   }
 
-  let claim
+  const claimOwner = { pid: process.pid, startedAt: new Date().toISOString(), token: randomUUID(), version: 1 }
+  let claimReceipt
   try {
-    claim = await open(
-      paths.recoveryClaim,
-      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW ?? 0),
-      0o600,
-    )
+    claimReceipt = await createOwnedJson(paths.recoveryClaim, claimOwner, parent)
   } catch (error) {
-    if (error?.code === 'EEXIST') fail('activation_in_progress', 'Another activation or recovery owns this provider destination.')
-    throw error
+    if (error?.code !== 'EEXIST') throw error
+    const existingClaim = await readOwnedJson(paths.recoveryClaim, 'Activation recovery claim')
+    if (processIsAlive(existingClaim.owner.pid)) {
+      fail('activation_in_progress', 'Another activation or recovery owns this provider destination.')
+    }
+    await removeOwnedJson(existingClaim, 'recovered-claim', parent)
+    claimReceipt = await createOwnedJson(paths.recoveryClaim, claimOwner, parent).catch((claimError) => {
+      if (claimError?.code === 'EEXIST') {
+        fail('activation_in_progress', 'Another activation or recovery owns this provider destination.')
+      }
+      throw claimError
+    })
   }
   try {
-    const existing = await readBoundedJson(paths.lock)
-    if (processIsAlive(existing?.pid)) {
+    const existing = await readOwnedJson(paths.lock, 'Activation lock')
+    if (processIsAlive(existing.owner.pid)) {
       fail('activation_in_progress', 'Another activation owns this provider destination.')
     }
-    await unlink(paths.lock)
-    await fsyncDirectory(parent)
-    await tryCreate()
+    await removeOwnedJson(existing, 'recovered-lock', parent)
+    return await tryCreate()
   } finally {
-    await claim.close().catch(() => {})
-    await unlink(paths.recoveryClaim).catch(() => {})
-    await fsyncDirectory(parent).catch(() => {})
+    if (claimReceipt) await removeOwnedJson(claimReceipt, 'settled-claim', parent)
   }
-  return paths.lock
 }
 
 async function materializeRelease(stage, release) {
@@ -487,9 +679,16 @@ async function readFilesystemTree(root) {
   const entries = []
   let fileCount = 0
   let totalBytes = 0
-  async function walk(directory, prefix = '') {
+  async function walk(directory, prefix = '', expectedDirectoryStat = undefined) {
+    const before = await lstat(directory, { bigint: true })
+    if (
+      !before.isDirectory()
+      || before.isSymbolicLink()
+      || (expectedDirectoryStat && !sameStat(before, expectedDirectoryStat))
+    ) fail('filesystem_changed', 'Installed Skill directory changed before verification.')
     const children = await readdir(directory, { withFileTypes: true })
-    children.sort((left, right) => left.name.localeCompare(right.name))
+    if (children.length > MAX_FILES * 2) fail('filesystem_changed', 'Installed Skill exceeds the entry budget.')
+    children.sort((left, right) => compareStrings(left.name, right.name))
     for (const child of children) {
       const childPath = join(directory, child.name)
       const path = normalizeGitPath(prefix ? `${prefix}/${child.name}` : child.name)
@@ -497,7 +696,7 @@ async function readFilesystemTree(root) {
       if (childStat.isSymbolicLink()) fail('filesystem_changed', 'Installed Skill contains a symbolic link.')
       if (childStat.isDirectory()) {
         entries.push({ path, type: 'directory' })
-        await walk(childPath, path)
+        await walk(childPath, path, childStat)
         continue
       }
       if (!childStat.isFile()) fail('filesystem_changed', 'Installed Skill contains a special file.')
@@ -508,9 +707,13 @@ async function readFilesystemTree(root) {
       if (totalBytes > MAX_TREE_BYTES) fail('filesystem_changed', 'Installed Skill exceeds the content budget.')
       entries.push({ ...file, path, type: 'file' })
     }
+    const after = await lstat(directory, { bigint: true })
+    if (!after.isDirectory() || after.isSymbolicLink() || !sameStat(before, after)) {
+      fail('filesystem_changed', 'Installed Skill directory changed during verification.')
+    }
   }
-  await walk(root)
-  entries.sort((left, right) => left.path.localeCompare(right.path) || left.type.localeCompare(right.type))
+  await walk(root, '', rootStat)
+  entries.sort((left, right) => compareStrings(left.path, right.path) || compareStrings(left.type, right.type))
   return { fileCount, treeDigest: hashTreeEntries(entries) }
 }
 
@@ -523,17 +726,43 @@ async function readTreeIfPresent(path) {
   }
 }
 
-function requireJournal(value, destination) {
+function requireJournal(value, destination, expectedProvider) {
   if (
     !isRecord(value)
+    || !hasExactKeys(value, [
+      'destination',
+      'fromCommit',
+      'fromTag',
+      'helperCommit',
+      'helperTag',
+      'intent',
+      'newTreeDigest',
+      'operationId',
+      'phase',
+      'previousTreeDigest',
+      'provider',
+      'targetCommit',
+      'targetTag',
+      'version',
+    ])
     || value.version !== TRANSACTION_VERSION
-    || !PROVIDERS.has(value.provider)
+    || value.provider !== expectedProvider
     || value.destination !== destination
     || typeof value.operationId !== 'string'
-    || !/^[0-9a-f-]{36}$/.test(value.operationId)
-    || !commitPattern.test(value.expectedCommit)
+    || !operationIdPattern.test(value.operationId)
+    || !TRANSITION_INTENTS.has(value.intent)
+    || !commitPattern.test(value.helperCommit)
+    || !tagPattern.test(value.helperTag)
+    || !commitPattern.test(value.targetCommit)
+    || !tagPattern.test(value.targetTag)
+    || !(
+      value.intent === 'install'
+        ? value.fromCommit === null && value.fromTag === null && value.previousTreeDigest === null
+        : commitPattern.test(value.fromCommit)
+          && tagPattern.test(value.fromTag)
+          && /^[0-9a-f]{64}$/.test(value.previousTreeDigest)
+    )
     || !/^[0-9a-f]{64}$/.test(value.newTreeDigest)
-    || !(value.previousTreeDigest === null || /^[0-9a-f]{64}$/.test(value.previousTreeDigest))
     || !['staged', 'previous-retired', 'activated'].includes(value.phase)
   ) fail('transaction_corrupt', 'Activation journal is invalid.')
   return value
@@ -553,7 +782,16 @@ async function removeOwnedTree(path, expectedDigest) {
   const tree = await readTreeIfPresent(path)
   if (!tree) return
   if (tree.treeDigest !== expectedDigest) fail('filesystem_changed', 'Activation-owned directory no longer matches its receipt.')
-  await rm(path, { recursive: true })
+  const parent = dirname(path)
+  const quarantine = `${path}.settled-${randomUUID()}`
+  await rename(path, quarantine)
+  await fsyncDirectory(parent)
+  const moved = await readFilesystemTree(quarantine)
+  if (moved.treeDigest !== expectedDigest || moved.fileCount !== tree.fileCount) {
+    fail('filesystem_changed', 'Activation-owned directory changed before cleanup; the moved tree was preserved.')
+  }
+  await rm(quarantine, { recursive: true })
+  await fsyncDirectory(parent)
 }
 
 async function removeJournal(journalPath, parent) {
@@ -563,7 +801,7 @@ async function removeJournal(journalPath, parent) {
   await fsyncDirectory(parent)
 }
 
-async function recoverTransaction({ destination, journalPath, parent }) {
+async function recoverTransaction({ destination, journalPath, parent, provider }) {
   let rawJournal
   try {
     rawJournal = await readBoundedJson(journalPath)
@@ -571,7 +809,7 @@ async function recoverTransaction({ destination, journalPath, parent }) {
     if (error?.code === 'ENOENT') return { recoveredPreviousRelease: false }
     throw error
   }
-  const journal = requireJournal(rawJournal, destination)
+  const journal = requireJournal(rawJournal, destination, provider)
   const paths = transactionPaths(parent, journal.operationId)
   const [active, backup, stage] = await Promise.all([
     readTreeIfPresent(destination),
@@ -653,27 +891,47 @@ export async function activatePortaWorkflowSkill(input) {
   const provider = requireProvider(input.provider)
   const providerHome = requireAbsolutePath(input.providerHome, 'Provider home')
   const destination = resolvePortaWorkflowSkillDestination({ provider, providerHome })
-  const release = await loadImmutableRelease(input)
+  const helperRelease = requireReleaseEvidence(input.helperRelease, 'Helper')
+  const transition = requireTransition(input.transition)
+  await verifySourceRepository({
+    expectedRepositoryUrl: input.expectedRepositoryUrl,
+    helperRelease,
+    sourceRepository: input.sourceRepository,
+  })
+  const release = await loadImmutableRelease({
+    release: transition.to,
+    sourceRepository: input.sourceRepository,
+  })
+  const approvedPreviousRelease = transition.from
+    ? await loadImmutableRelease({ release: transition.from, sourceRepository: input.sourceRepository })
+    : undefined
   const parent = await ensureActivationParent(providerHome)
   if (dirname(destination) !== parent) fail('invalid_path', 'Provider destination does not match its canonical user-level root.')
 
-  const lockPath = await acquireTransactionLock(parent)
+  const lockReceipt = await acquireTransactionLock(parent)
   const commonPaths = transactionPaths(parent, 'pending')
   let recovery = { recoveredPreviousRelease: false }
   let currentOperationPaths
   let journal
   try {
-    recovery = await recoverTransaction({ destination, journalPath: commonPaths.journal, parent })
+    recovery = await recoverTransaction({ destination, journalPath: commonPaths.journal, parent, provider })
     if (recovery.activatedTreeDigest === release.treeDigest) {
       const installed = await readFilesystemTree(destination)
       return {
-        action: 'updated',
+        action: transition.intent === 'rollback' ? 'rolled-back' : 'updated',
         commitSha: release.commitSha,
         fileCount: installed.fileCount,
+        helperCommitSha: helperRelease.commitSha,
+        helperTag: helperRelease.tag,
         installedPath: destination,
+        intent: transition.intent,
         provider,
         recoveredPreviousRelease: false,
         repositoryUrl: input.expectedRepositoryUrl,
+        ...(transition.from ? {
+          sourceCommitSha: transition.from.commitSha,
+          sourceTag: transition.from.tag,
+        } : {}),
         tag: release.tag,
         treeDigest: installed.treeDigest,
         type: 'porta-workflow-skill-activation-receipt',
@@ -686,14 +944,33 @@ export async function activatePortaWorkflowSkill(input) {
         action: 'unchanged',
         commitSha: release.commitSha,
         fileCount: previous.fileCount,
+        helperCommitSha: helperRelease.commitSha,
+        helperTag: helperRelease.tag,
         installedPath: destination,
+        intent: transition.intent,
         provider,
         recoveredPreviousRelease: recovery.recoveredPreviousRelease,
         repositoryUrl: input.expectedRepositoryUrl,
+        ...(transition.from ? {
+          sourceCommitSha: transition.from.commitSha,
+          sourceTag: transition.from.tag,
+        } : {}),
         tag: release.tag,
         treeDigest: previous.treeDigest,
         type: 'porta-workflow-skill-activation-receipt',
       }
+    }
+    if (transition.intent === 'install') {
+      if (previous) {
+        fail('transition_source_mismatch', 'Fresh installation requires the Provider destination to be absent.')
+      }
+    } else if (
+      !previous
+      || !approvedPreviousRelease
+      || previous.treeDigest !== approvedPreviousRelease.treeDigest
+      || previous.fileCount !== approvedPreviousRelease.fileCount
+    ) {
+      fail('transition_source_mismatch', 'Installed Skill does not match the exact approved source release for this transition.')
     }
     const operationId = randomUUID()
     currentOperationPaths = transactionPaths(parent, operationId)
@@ -713,12 +990,18 @@ export async function activatePortaWorkflowSkill(input) {
     }
     journal = {
       destination,
-      expectedCommit: release.commitSha,
+      fromCommit: transition.from?.commitSha ?? null,
+      fromTag: transition.from?.tag ?? null,
+      helperCommit: helperRelease.commitSha,
+      helperTag: helperRelease.tag,
+      intent: transition.intent,
       newTreeDigest: release.treeDigest,
       operationId,
       phase: 'staged',
       previousTreeDigest: previous?.treeDigest ?? null,
       provider,
+      targetCommit: transition.to.commitSha,
+      targetTag: transition.to.tag,
       version: TRANSACTION_VERSION,
     }
     await writeJournal(commonPaths.journal, journal)
@@ -731,6 +1014,10 @@ export async function activatePortaWorkflowSkill(input) {
       }
       await rename(destination, currentOperationPaths.backup)
       await fsyncDirectory(parent)
+      const backup = await readFilesystemTree(currentOperationPaths.backup)
+      if (backup.treeDigest !== previous.treeDigest || backup.fileCount !== previous.fileCount) {
+        fail('filesystem_changed', 'Retired Skill no longer matches the approved source release.')
+      }
       journal = { ...journal, phase: 'previous-retired' }
       await writeJournal(commonPaths.journal, journal)
       await invokeHook(input.hooks, 'after-previous-retired')
@@ -749,21 +1036,30 @@ export async function activatePortaWorkflowSkill(input) {
     if (previous) await removeOwnedTree(currentOperationPaths.backup, previous.treeDigest)
     await removeJournal(commonPaths.journal, parent)
     return {
-      action: previous ? 'updated' : 'installed',
+      action: previous
+        ? transition.intent === 'rollback' ? 'rolled-back' : 'updated'
+        : 'installed',
       commitSha: release.commitSha,
       fileCount: active.fileCount,
+      helperCommitSha: helperRelease.commitSha,
+      helperTag: helperRelease.tag,
       installedPath: destination,
+      intent: transition.intent,
       ...(previous ? { previousTreeDigest: previous.treeDigest } : {}),
       provider,
       recoveredPreviousRelease: recovery.recoveredPreviousRelease,
       repositoryUrl: input.expectedRepositoryUrl,
+      ...(transition.from ? {
+        sourceCommitSha: transition.from.commitSha,
+        sourceTag: transition.from.tag,
+      } : {}),
       tag: release.tag,
       treeDigest: active.treeDigest,
       type: 'porta-workflow-skill-activation-receipt',
     }
   } catch (error) {
     try {
-      await recoverTransaction({ destination, journalPath: commonPaths.journal, parent })
+      await recoverTransaction({ destination, journalPath: commonPaths.journal, parent, provider })
       if (!journal && currentOperationPaths && await pathExists(currentOperationPaths.stage)) {
         await removeOwnedTree(currentOperationPaths.stage, release.treeDigest)
       }
@@ -772,8 +1068,7 @@ export async function activatePortaWorkflowSkill(input) {
     }
     throw error
   } finally {
-    await unlink(lockPath).catch(() => {})
-    await fsyncDirectory(parent).catch(() => {})
+    await removeOwnedJson(lockReceipt, 'settled-lock', parent)
   }
 }
 
@@ -787,14 +1082,27 @@ function parseArguments(tokens) {
     }
     values.set(name, value)
   }
-  const expected = new Set([
-    '--expected-commit',
+  const base = new Set([
     '--expected-repository-url',
-    '--expected-tag',
+    '--helper-commit',
+    '--helper-tag',
+    '--intent',
     '--provider',
     '--source-repository',
+    '--target-commit',
+    '--target-tag',
   ])
-  if (values.size !== expected.size || [...values.keys()].some((name) => !expected.has(name))) {
+  const intent = values.get('--intent')
+  const expected = new Set(base)
+  if (intent === 'update' || intent === 'rollback') {
+    expected.add('--source-commit')
+    expected.add('--source-tag')
+  }
+  if (
+    !TRANSITION_INTENTS.has(intent)
+    || values.size !== expected.size
+    || [...values.keys()].some((name) => !expected.has(name))
+  ) {
     fail('invalid_arguments', 'Activation requires the exact documented option set.')
   }
   return values
@@ -803,8 +1111,9 @@ function parseArguments(tokens) {
 function help() {
   return `Porta Workflow Skill activation transaction\n\n` +
     `Usage:\n` +
-    `  node porta-workflow-skill-activation.mjs activate --provider <codex|claude|gemini> --source-repository <canonical-path> --expected-repository-url <https-url> --expected-tag <tag> --expected-commit <full-sha>\n\n` +
-    `The command reads the complete /porta-workflow subdirectory from the exact annotated Git tag and commit, stages it beside the provider's user-level Skill directory, and restores the previous exact tree after a recoverable failure. It never activates a WorkRun.\n`
+    `  node porta-workflow-skill-activation.mjs activate --provider <codex|claude|gemini> --source-repository <canonical-path> --expected-repository-url <https-url> --helper-tag <tag> --helper-commit <full-sha> --intent install --target-tag <tag> --target-commit <full-sha>\n` +
+    `  node porta-workflow-skill-activation.mjs activate --provider <codex|claude|gemini> --source-repository <canonical-path> --expected-repository-url <https-url> --helper-tag <tag> --helper-commit <full-sha> --intent <update|rollback> --source-tag <tag> --source-commit <full-sha> --target-tag <tag> --target-commit <full-sha>\n\n` +
+    `The command verifies the helper checkout, exact approved source and target releases, stages the complete target tree beside the provider's user-level Skill directory, and restores the source release after a recoverable failure. It never activates a WorkRun.\n`
 }
 
 async function main() {
@@ -817,12 +1126,27 @@ async function main() {
   const values = parseArguments(tokens)
   const provider = values.get('--provider')
   const receipt = await activatePortaWorkflowSkill({
-    expectedCommit: values.get('--expected-commit'),
     expectedRepositoryUrl: values.get('--expected-repository-url'),
-    expectedTag: values.get('--expected-tag'),
+    helperRelease: {
+      commitSha: values.get('--helper-commit'),
+      tag: values.get('--helper-tag'),
+    },
     provider,
     providerHome: resolveDefaultProviderHome(provider),
-    sourceRepository: resolve(values.get('--source-repository') ?? ''),
+    sourceRepository: values.get('--source-repository'),
+    transition: {
+      ...(values.get('--intent') === 'install' ? {} : {
+        from: {
+          commitSha: values.get('--source-commit'),
+          tag: values.get('--source-tag'),
+        },
+      }),
+      intent: values.get('--intent'),
+      to: {
+        commitSha: values.get('--target-commit'),
+        tag: values.get('--target-tag'),
+      },
+    },
   })
   process.stdout.write(`${JSON.stringify({ ok: true, ...receipt }, null, 2)}\n`)
 }
