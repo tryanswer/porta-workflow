@@ -24,6 +24,14 @@ Compare the resolved commit with the full SHA shown by Porta. Do not install fro
 
 Explicit `$porta-workflow`, `/porta-workflow`, or equivalent Provider activation remains supported. Natural-language selection is allowed only when the current message itself contains unambiguous publication intent and trusted current Porta/Bridge context identifies Porta as the release target.
 
+## Verify
+
+Run the public release identity contract together with the installable Skill tests:
+
+```bash
+node --test tests/*.test.mjs porta-workflow/tests/*.test.mjs
+```
+
 ## Boundaries
 
 - The Skill uses the Agent Bridge already installed and managed by Porta; it never installs or upgrades Bridge itself.
