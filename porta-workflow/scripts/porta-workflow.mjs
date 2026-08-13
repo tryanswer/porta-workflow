@@ -27,8 +27,9 @@ const MINIMUM_LEGACY_WORKFLOW_RUNTIME = '1.9.0'
 const MINIMUM_RELEASE_WORKFLOW_RUNTIME = '1.14.0'
 const MINIMUM_SCENE_PACK_READINESS_RUNTIME = '1.16.1'
 const SKILL_ID = 'porta-workflow'
-const SKILL_VERSION = '2.4.0'
+const SKILL_VERSION = '2.4.1'
 const RESUMABLE_LEGACY_SKILL_VERSIONS = new Set(['0.1.0', '0.1.1'])
+const RESUMABLE_PRIOR_SKILL_VERSIONS = new Set(['2.4.0'])
 const MAXIMUM_BRIDGE_OUTPUT_BYTES = 1024 * 1024
 const MAXIMUM_SPEC_BYTES = 1024 * 1024
 const MAXIMUM_SCENE_PACK_READINESS_SPEC_BYTES = 24 * 1024
@@ -1386,6 +1387,7 @@ function validateState(value) {
   ], 'client state')
   const workflowProtocolVersion = workflowProtocolVersionForState(state)
   const skillVersionValid = state.skillVersion === SKILL_VERSION ||
+    RESUMABLE_PRIOR_SKILL_VERSIONS.has(state.skillVersion) ||
     (
       workflowProtocolVersion === LEGACY_WORKFLOW_PROTOCOL_VERSION &&
       RESUMABLE_LEGACY_SKILL_VERSIONS.has(state.skillVersion)

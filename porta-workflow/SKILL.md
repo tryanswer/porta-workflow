@@ -13,6 +13,12 @@ implement, build, test, and run the project; use the bundled client only for
 the fixed Agent Bridge protocol. Retain Workflow v1 only for an explicitly
 requested legacy Web or Android APK Product Preview.
 
+## Scene Pack installation and update
+
+- A Scene Pack installation Agent may run the bundled activation transaction directly without activating this Skill. Read [references/skill-activation.md](references/skill-activation.md) completely and use only the exact repository, annotated tag, full SHA, Provider, and transition supplied by the current trusted Scene prompt.
+- For an existing installation, do not call a Provider-native overwrite/update command. Run the bundled activation helper from the clean exact release checkout; it stages the complete Git subdirectory beside the user-level Provider Skill directory, journals the transition, and restores the exact previous tree after a recoverable failure. An unknown replacement or corrupt receipt fails closed and preserves recovery evidence.
+- Installation or update success is not Provider discovery. Perform the Provider-native reload or new-session step separately, observe discovery, and only then submit the neutral readiness claim below. The activation receipt is local transaction evidence, not a WorkRun, publication authority, or Bridge attestation.
+
 ## Scene Pack readiness
 
 - A Scene Pack installation Agent may run the bundled readiness client directly without activating this Skill. Treat every field as the current Agent's structured claim: copy the catalog fingerprint, release identity, capabilities, skill paths, and Provider from the current Scene prompt, then add only discovery and reload observations made through the current Provider's native Skill lifecycle.

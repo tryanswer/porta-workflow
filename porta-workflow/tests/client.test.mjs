@@ -138,7 +138,7 @@ if (command === 'pull' && workflowVersion === 2) {
       } : {}),
       requestId,
       skillId: 'porta-workflow',
-      skillVersion: '2.4.0',
+      skillVersion: '2.4.1',
       sourceSequence: 7,
       status,
       ...(status === 'ready' ? { terminalAt: '2026-07-31T10:10:00.000Z' } : {}),
@@ -521,7 +521,7 @@ test('begin persists exact Bridge identity and replays locally without a duplica
   const fixture = await createFixture()
   try {
     const { key, result } = await beginRun(fixture)
-    assert.equal(result.receipt.skillVersion, '2.4.0')
+    assert.equal(result.receipt.skillVersion, '2.4.1')
     assert.equal(result.receipt.workRunId, 'workrun_33333333-3333-4333-8333-333333333333')
     const replay = parseSuccess(run(fixture, ['begin', '--run-key', key, '--provider', 'codex']))
     assert.equal(replay.cached, true)
@@ -563,6 +563,31 @@ test('new client can recover an uncertain begin from the released v1 Skill state
     const beginCalls = calls.filter((call) => call[1] === 'begin')
     assert.equal(beginCalls.length, 2)
     assert.equal(beginCalls.at(-1)[beginCalls.at(-1).indexOf('--skill-version') + 1], '0.1.1')
+  } finally {
+    await fixture.cleanup()
+  }
+})
+
+test('2.4.1 client can recover an uncertain v2 begin created by 2.4.0', async () => {
+  const fixture = await createFixture()
+  try {
+    const { key, result } = await beginReleaseRun(fixture)
+    const state = JSON.parse(await readFile(result.stateFile, 'utf8'))
+    delete state.receipt
+    state.skillVersion = '2.4.0'
+    await writeFile(result.stateFile, JSON.stringify(state))
+
+    const recovered = parseSuccess(run(fixture, [
+      'begin',
+      '--workflow-protocol-version', '2',
+      '--run-key', key,
+      '--provider', 'codex',
+    ]))
+    assert.equal(recovered.receipt.skillVersion, '2.4.0')
+    const calls = (await readFile(fixture.log, 'utf8')).trim().split('\n').map(JSON.parse)
+    const beginCalls = calls.filter((call) => call[1] === 'begin')
+    assert.equal(beginCalls.length, 2)
+    assert.equal(beginCalls.at(-1)[beginCalls.at(-1).indexOf('--skill-version') + 1], '2.4.0')
   } finally {
     await fixture.cleanup()
   }
@@ -921,7 +946,7 @@ test('Workflow v2 capability preflight and begin are explicit and preserve the P
     ])
 
     const { key, result } = await beginReleaseRun(fixture)
-    assert.equal(result.receipt.skillVersion, '2.4.0')
+    assert.equal(result.receipt.skillVersion, '2.4.1')
     assert.equal(result.receipt.status, 'implementing')
     assert.equal(result.receipt.publishIntent.projectRef, 'project_fixture-1234')
     assert.equal(result.receipt.publishIntent.projectContextGeneration, 1)

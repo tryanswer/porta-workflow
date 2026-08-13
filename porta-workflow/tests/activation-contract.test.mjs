@@ -8,6 +8,7 @@ const openaiMetadataPath = fileURLToPath(new URL('../agents/openai.yaml', import
 const activationCasesPath = fileURLToPath(new URL('../evals/activation-cases.json', import.meta.url))
 const releaseReferencePath = fileURLToPath(new URL('../references/bridge-workflow-v2.md', import.meta.url))
 const legacyReferencePath = fileURLToPath(new URL('../references/bridge-workflow-v1.md', import.meta.url))
+const activationReferencePath = fileURLToPath(new URL('../references/skill-activation.md', import.meta.url))
 
 function readFrontmatterDescription(skill) {
   const match = skill.match(/^---\n[\s\S]*?^description:\s*(.+)\n[\s\S]*?^---$/m)
@@ -141,4 +142,23 @@ test('activation eval corpus covers positive, negative, ambiguous, competing-tar
   ))) {
     assert.equal(activationCase.expected.workRunAction, 'none')
   }
+})
+
+test('Scene installation uses the bundled recoverable transaction without becoming publication intent', async () => {
+  const [skill, reference] = await Promise.all([
+    readFile(skillPath, 'utf8'),
+    readFile(activationReferencePath, 'utf8'),
+  ])
+  const normalizedSkill = skill.replace(/\s+/g, ' ')
+  const normalizedReference = reference.replace(/\s+/g, ' ')
+
+  assert.match(normalizedSkill, /run the bundled activation transaction directly without activating this Skill/)
+  assert.match(normalizedSkill, /do not call a Provider-native overwrite\/update command/)
+  assert.match(normalizedSkill, /Installation or update success is not Provider discovery/)
+  assert.match(normalizedReference, /exact annotated release tag and full 40-character commit SHA/)
+  assert.match(normalizedReference, /reads file bytes from the exact Git commit object rather than from mutable worktree paths/)
+  assert.match(normalizedReference, /failure after the previous tree is retired restores that exact backup/)
+  assert.match(normalizedReference, /next invocation first claims the dead transaction/)
+  assert.match(normalizedReference, /does not activate Porta Workflow, authorize publication, call `begin`, or create a WorkRun/)
+  assert.match(normalizedReference, /It does not prove Provider discovery\/reload/)
 })

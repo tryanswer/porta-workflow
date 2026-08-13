@@ -78,8 +78,8 @@ current Provider's native discovery/reload lifecycle:
   "readiness": "ready",
   "release": {
     "commitSha": "0123456789abcdef0123456789abcdef01234567",
-    "tag": "porta-workflow-v2.4.0",
-    "version": "2.4.0"
+    "tag": "porta-workflow-v2.4.1",
+    "version": "2.4.1"
   },
   "reloadObservation": "not-required"
 }

@@ -11,16 +11,20 @@ The normal path is to send Porta's built-in Porta Workflow installation scene to
 For manual inspection, clone the fixed release before using the Agent's native user-level mechanism:
 
 ```bash
-git clone --branch porta-workflow-v2.4.0 --single-branch https://github.com/tryanswer/porta-workflow.git
+git clone --branch porta-workflow-v2.4.1 --single-branch https://github.com/tryanswer/porta-workflow.git
 cd porta-workflow
 git rev-parse HEAD
 ```
 
 Compare the resolved commit with the full SHA shown by Porta. Do not install from a moving branch.
 
-- Codex: install `porta-workflow/` as the user skill `porta-workflow`.
-- Claude Code: install `porta-workflow/` as the user skill `porta-workflow`.
-- Gemini CLI: install the checked-out local directory with `gemini skills install ./porta-workflow --scope user`.
+For an existing user-level installation, the Scene Agent must not use a Provider's overwrite behavior as the update transaction. From the clean exact release checkout it runs the bundled `porta-workflow/scripts/porta-workflow-skill-activation.mjs` helper with the catalog repository, annotated tag, full SHA, and current Provider. The helper stages the complete Git subdirectory beside the Provider Skill directory, verifies the active tree, and restores the exact prior tree if activation fails before settlement. See [`skill-activation.md`](porta-workflow/references/skill-activation.md).
+
+- Codex: fresh install at user scope, then use a new Agent session for discovery.
+- Claude Code: install at user scope, then use its native Skill reload.
+- Gemini CLI: fresh install at user scope, then use `/skills reload`.
+
+The recoverable helper currently supports macOS, Linux, and WSL. Native Windows updates fail closed until equivalent directory settlement and recovery evidence is implemented. Installation success is not discovery evidence; the Agent reports `ready` only after the separate Provider reload/new-session lifecycle observes the exact release.
 
 Explicit `$porta-workflow`, `/porta-workflow`, or equivalent Provider activation remains supported. Natural-language selection is allowed only when the current message itself contains unambiguous publication intent and trusted current Porta/Bridge context identifies Porta as the release target.
 
