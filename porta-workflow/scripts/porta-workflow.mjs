@@ -2,10 +2,12 @@
 
 import { createHash, randomUUID } from 'node:crypto'
 import { execFile as execFileCallback } from 'node:child_process'
+import { constants as fsConstants } from 'node:fs'
 import {
   chmod,
   lstat,
   mkdir,
+  open,
   readFile,
   realpath,
   rename,
@@ -19,20 +21,45 @@ import { promisify } from 'node:util'
 
 const execFile = promisify(execFileCallback)
 const CLIENT_STATE_VERSION = 1
-const EVENT_CONTRACT_VERSION = 1
-const MINIMUM_WORKFLOW_RUNTIME = '1.9.0'
+const LEGACY_WORKFLOW_PROTOCOL_VERSION = 1
+const RELEASE_WORKFLOW_PROTOCOL_VERSION = 2
+const MINIMUM_LEGACY_WORKFLOW_RUNTIME = '1.9.0'
+const MINIMUM_RELEASE_WORKFLOW_RUNTIME = '1.14.0'
+const MINIMUM_SCENE_PACK_READINESS_RUNTIME = '1.16.1'
 const SKILL_ID = 'porta-workflow'
-const SKILL_VERSION = '0.1.1'
+const SKILL_VERSION = '2.4.0'
+const RESUMABLE_LEGACY_SKILL_VERSIONS = new Set(['0.1.0', '0.1.1'])
 const MAXIMUM_BRIDGE_OUTPUT_BYTES = 1024 * 1024
 const MAXIMUM_SPEC_BYTES = 1024 * 1024
+const MAXIMUM_SCENE_PACK_READINESS_SPEC_BYTES = 24 * 1024
 const MAXIMUM_OPERATIONS = 256
 const providers = new Set(['codex', 'claude', 'gemini'])
-const progressPhases = new Set(['building', 'implementing', 'planning', 'testing', 'waiting'])
+const scenePackCapabilityOrder = ['build', 'preview', 'deploy', 'publish']
+const scenePackReadinessFields = [
+  'capabilities',
+  'catalogFingerprint',
+  'catalogId',
+  'installedSkills',
+  'provider',
+  'providerDiscovery',
+  'readiness',
+  'release',
+  'reloadObservation',
+]
+const legacyProgressPhases = new Set(['building', 'implementing', 'planning', 'testing', 'waiting'])
+const releaseProgressPhases = new Set([
+  ...legacyProgressPhases,
+  'freezing',
+  'previewing',
+  'transferring',
+  'verifying',
+])
 const terminalOutcomes = new Set(['failed', 'unsupported'])
 const runKeyPattern = /^run_[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const operationKeyPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/
 const reasonCodePattern = /^[a-z][a-z0-9._:-]{0,119}$/
 const semverPattern = /^(\d+)\.(\d+)\.(\d+)$/
+const strictSemverPattern = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/
 const workflowRunPattern = /^workrun_[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 
 class ClientError extends Error {
@@ -59,9 +86,14 @@ async function main() {
     return
   }
   if (command === 'capabilities') {
-    requireNoArguments(tokens)
-    const capabilities = await readCapabilities()
+    const options = parseOptions(tokens, ['workflow-protocol-version'])
+    const workflowProtocolVersion = requireWorkflowProtocolVersion(options['workflow-protocol-version'])
+    const capabilities = await readCapabilities(workflowProtocolVersion)
     writeResult({ capabilities, ok: true, type: 'porta-workflow-client-capabilities' })
+    return
+  }
+  if (command === 'scene-pack-readiness-observe') {
+    await observeScenePackReadiness(tokens)
     return
   }
   if (command === 'begin') {
@@ -72,11 +104,25 @@ async function main() {
     await show(tokens)
     return
   }
+  if (command === 'release-status') {
+    await releaseStatus(tokens)
+    return
+  }
   if (command === 'manifest') {
     await writeManifest(tokens)
     return
   }
-  if (['attention', 'fail', 'preview-start', 'progress', 'ready', 'stop'].includes(command)) {
+  if ([
+    'attention',
+    'cancel',
+    'candidate-register',
+    'fail',
+    'preview-start',
+    'progress',
+    'preview-ready',
+    'ready',
+    'stop',
+  ].includes(command)) {
     await mutate(command, tokens)
     return
   }
@@ -85,15 +131,25 @@ async function main() {
 
 function helpText() {
   return `Porta Workflow client ${SKILL_VERSION}\n\n` +
-    `Usage:\n` +
-    `  porta-workflow.mjs capabilities\n` +
+    `Scene Pack readiness (Agent-observed UX signal; dedupe/LKG only; no WorkRun or publish authority):\n` +
+    `  porta-workflow.mjs scene-pack-readiness-observe --spec <json-file>\n\n` +
+    `Workflow v2 Static HTML publication (the version selector is required):\n` +
+    `  porta-workflow.mjs capabilities --workflow-protocol-version 2\n` +
     `  porta-workflow.mjs new-run-key\n` +
-    `  porta-workflow.mjs begin --run-key <key> --provider <codex|claude|gemini> [--provider-session-id <id>] [--cwd <path>]\n` +
+    `  porta-workflow.mjs begin --workflow-protocol-version 2 --run-key <key> --provider <codex|claude|gemini> [--provider-session-id <id>] [--cwd <path>]\n` +
     `  porta-workflow.mjs show --run-key <key> [--cwd <path>]\n` +
     `  porta-workflow.mjs progress --run-key <key> --operation-key <key> --phase <phase> [--percent <0-100>] [--summary <text>] [--cwd <path>]\n` +
-    `  porta-workflow.mjs preview-start --run-key <key> [--cwd <path>]\n` +
+    `  porta-workflow.mjs preview-start --run-key <key> --operation-key <key> [--cwd <path>]\n` +
     `  porta-workflow.mjs attention --run-key <key> --operation-key <key> --reason-code <code> [--cwd <path>]\n` +
     `  porta-workflow.mjs manifest --run-key <key> --spec <json-file> [--cwd <path>]\n` +
+    `  porta-workflow.mjs preview-ready --run-key <key> --operation-key <key> [--cwd <path>]  # nonterminal\n` +
+    `  porta-workflow.mjs candidate-register --run-key <key> --operation-key <key> --output-root <path> --entry-path <path> --display-name <name> --spa-fallback <0|1> [--cwd <path>]\n` +
+    `  porta-workflow.mjs release-status --run-key <key> [--cwd <path>]\n` +
+    `  porta-workflow.mjs cancel --run-key <key> [--cwd <path>]\n` +
+    `  porta-workflow.mjs fail --run-key <key> --reason-code <code> [--cwd <path>]\n\n` +
+    `Workflow v1 legacy Product Preview (protocol selector omitted or 1):\n` +
+    `  porta-workflow.mjs capabilities\n` +
+    `  porta-workflow.mjs begin --run-key <key> --provider <codex|claude|gemini> [--provider-session-id <id>] [--cwd <path>]\n` +
     `  porta-workflow.mjs ready --run-key <key> [--cwd <path>]\n` +
     `  porta-workflow.mjs fail --run-key <key> --outcome <failed|unsupported> [--reason-code <code>] [--cwd <path>]\n` +
     `  porta-workflow.mjs stop --run-key <key> [--cwd <path>]\n` +
@@ -101,13 +157,45 @@ function helpText() {
     `Set PORTA_BRIDGE_BIN only when Porta installed the Bridge launcher outside PATH.\n`
 }
 
+async function observeScenePackReadiness(tokens) {
+  const options = parseOptions(tokens, ['spec'])
+  const observation = await readScenePackReadinessSpec(options.spec)
+  const bridgeCapabilities = await readScenePackReadinessCapabilities()
+  const idempotencyKey = scenePackReadinessIdempotencyKey(observation)
+  const traceId = `porta-skill-scene-readiness:${randomUUID()}`
+  const payload = Buffer.from(JSON.stringify({ ...observation, version: 1 }), 'utf8')
+    .toString('base64url')
+  const receipt = validateScenePackReadinessReceipt(await runBridge([
+    'workflow',
+    'scene-pack-readiness-observe',
+    '--payload', payload,
+    '--idempotency-key', idempotencyKey,
+    '--trace-id', traceId,
+    '--json',
+  ]), observation, traceId)
+  writeResult({
+    bridgeRuntimeVersion: bridgeCapabilities.runtimeVersion,
+    idempotencyKey,
+    ok: true,
+    receipt,
+    type: 'porta-workflow-client-scene-pack-readiness',
+  })
+}
+
 async function begin(tokens) {
-  const options = parseOptions(tokens, ['cwd', 'provider', 'provider-session-id', 'run-key'])
+  const options = parseOptions(tokens, [
+    'cwd',
+    'provider',
+    'provider-session-id',
+    'run-key',
+    'workflow-protocol-version',
+  ])
   const runKey = requireRunKey(options['run-key'])
   const provider = requireProvider(options.provider)
   const providerSessionId = optionalBoundedText(options['provider-session-id'], 256, 'provider session id')
+  const workflowProtocolVersion = requireWorkflowProtocolVersion(options['workflow-protocol-version'])
   const cwd = await resolveProjectCwd(options.cwd)
-  await readCapabilities()
+  await readCapabilities(workflowProtocolVersion)
   const stateFile = await ensureStateFile(cwd, runKey)
   const existing = await readOptionalState(stateFile)
   let state
@@ -116,7 +204,8 @@ async function begin(tokens) {
       existing.cwd !== cwd ||
       existing.provider !== provider ||
       existing.providerSessionId !== providerSessionId ||
-      existing.runKey !== runKey
+      existing.runKey !== runKey ||
+      workflowProtocolVersionForState(existing) !== workflowProtocolVersion
     ) {
       throw new ClientError('run_key_conflict', 'Run key is already bound to different begin input.')
     }
@@ -132,6 +221,9 @@ async function begin(tokens) {
       skillId: SKILL_ID,
       skillVersion: SKILL_VERSION,
       version: CLIENT_STATE_VERSION,
+      ...(workflowProtocolVersion === RELEASE_WORKFLOW_PROTOCOL_VERSION
+        ? { workflowProtocolVersion }
+        : {}),
     }
     await writeState(stateFile, state)
   }
@@ -142,13 +234,16 @@ async function begin(tokens) {
   const receipt = await runBridge([
     'workflow',
     'begin',
+    ...(workflowProtocolVersion === RELEASE_WORKFLOW_PROTOCOL_VERSION
+      ? ['--workflow-protocol-version', String(workflowProtocolVersion)]
+      : []),
     '--cwd', cwd,
-    '--event-contract-version', String(EVENT_CONTRACT_VERSION),
+    '--event-contract-version', String(workflowProtocolVersion),
     '--idempotency-key', state.beginIdempotencyKey,
     '--provider', provider,
     ...(providerSessionId ? ['--provider-session-id', providerSessionId] : []),
     '--skill-id', SKILL_ID,
-    '--skill-version', SKILL_VERSION,
+    '--skill-version', state.skillVersion,
     '--json',
   ])
   state.receipt = validateBeginReceipt(receipt, state)
@@ -174,6 +269,40 @@ async function show(tokens) {
     runKey: state.runKey,
     stateFile,
     type: 'porta-workflow-client-state',
+    workflowProtocolVersion: workflowProtocolVersionForState(state),
+  })
+}
+
+async function releaseStatus(tokens) {
+  const options = parseOptions(tokens, ['cwd', 'run-key'])
+  const { state, stateFile } = await loadState(options)
+  if (!state.receipt) {
+    throw new ClientError('workflow_not_begun', 'Run key has no completed Bridge begin receipt.')
+  }
+  if (workflowProtocolVersionForState(state) !== RELEASE_WORKFLOW_PROTOCOL_VERSION) {
+    throw new ClientError(
+      'unsupported_workflow_command',
+      'Release status requires a Workflow v2 run.',
+    )
+  }
+  const traceId = `porta-skill-release-status:${randomUUID()}`
+  const batch = await runBridge([
+    'workflow',
+    'pull',
+    '--workflow-protocol-version', String(RELEASE_WORKFLOW_PROTOCOL_VERSION),
+    '--after', '0',
+    '--limit', '1',
+    '--trace-id', traceId,
+    '--json',
+  ])
+  const run = validateReleaseStatusBatch(batch, state, traceId)
+  writeResult({
+    ok: true,
+    run,
+    runKey: state.runKey,
+    stateFile,
+    type: 'porta-workflow-client-release-status',
+    workflowProtocolVersion: RELEASE_WORKFLOW_PROTOCOL_VERSION,
   })
 }
 
@@ -206,9 +335,13 @@ async function mutate(command, tokens) {
     await writeState(stateFile, state)
   }
   const operation = state.operations[mutation.operationKey]
+  const workflowProtocolVersion = workflowProtocolVersionForState(state)
   const receipt = await runBridge([
     'workflow',
     mutation.bridgeCommand,
+    ...(workflowProtocolVersion === RELEASE_WORKFLOW_PROTOCOL_VERSION
+      ? ['--workflow-protocol-version', String(workflowProtocolVersion)]
+      : []),
     '--work-run-id', state.receipt.workRunId,
     '--idempotency-key', operation.idempotencyKey,
     ...mutation.bridgeArguments,
@@ -224,15 +357,33 @@ function mutationAllowedOptions(command) {
   const common = ['cwd', 'run-key']
   if (command === 'progress') return [...common, 'operation-key', 'percent', 'phase', 'summary']
   if (command === 'attention') return [...common, 'operation-key', 'reason-code']
+  if (
+    command === 'preview-ready' ||
+    command === 'preview-start' ||
+    command === 'ready'
+  ) return [...common, 'operation-key']
+  if (command === 'candidate-register') {
+    return [
+      ...common,
+      'display-name',
+      'entry-path',
+      'operation-key',
+      'output-root',
+      'spa-fallback',
+    ]
+  }
   if (command === 'fail') return [...common, 'outcome', 'reason-code']
   return common
 }
 
 function normalizeMutation(command, options, state) {
+  const workflowProtocolVersion = workflowProtocolVersionForState(state)
+  const isRelease = workflowProtocolVersion === RELEASE_WORKFLOW_PROTOCOL_VERSION
   if (command === 'progress') {
     const operationKey = requireOperationKey(options['operation-key'])
     const phase = String(options.phase ?? '')
-    if (!progressPhases.has(phase)) throw new ClientError('invalid_phase', 'Progress phase is invalid.')
+    const allowedPhases = isRelease ? releaseProgressPhases : legacyProgressPhases
+    if (!allowedPhases.has(phase)) throw new ClientError('invalid_phase', 'Progress phase is invalid.')
     const percent = optionalPercent(options.percent)
     const summary = optionalBoundedText(options.summary, 240, 'progress summary')
     return {
@@ -242,7 +393,9 @@ function normalizeMutation(command, options, state) {
         ...(summary ? ['--summary', summary] : []),
       ],
       bridgeCommand: 'progress',
-      expectedStatuses: ['active', 'building'],
+      expectedStatuses: isRelease
+        ? ['freezing', 'implementing', 'preview-ready', 'transferring', 'verifying']
+        : ['active', 'building'],
       input: { percent, phase, summary, workRunId: state.receipt.workRunId },
       operationKey,
     }
@@ -253,19 +406,118 @@ function normalizeMutation(command, options, state) {
     return {
       bridgeArguments: ['--reason-code', reasonCode],
       bridgeCommand: 'attention',
-      expectedStatuses: ['active', 'building'],
+      expectedStatuses: isRelease
+        ? ['freezing', 'implementing', 'preview-ready', 'transferring', 'verifying']
+        : ['active', 'building'],
       input: { reasonCode, workRunId: state.receipt.workRunId },
+      milestoneOptional: isRelease,
       operationKey,
     }
   }
   if (command === 'preview-start') {
-    return fixedMutation('preview-start', 'preview-start', [], { workRunId: state.receipt.workRunId }, ['building'])
+    const operationKey = isRelease
+      ? requireOperationKey(options['operation-key'])
+      : options['operation-key'] === undefined
+        ? 'preview-start'
+        : requireOperationKey(options['operation-key'])
+    return fixedMutation(
+      operationKey,
+      'preview-start',
+      [],
+      { workRunId: state.receipt.workRunId },
+      [isRelease ? 'implementing' : 'building'],
+    )
   }
-  if (command === 'ready') {
-    return fixedMutation('preview-ready', 'preview-ready', [], { workRunId: state.receipt.workRunId }, ['ready'])
+  if (command === 'ready' || command === 'preview-ready') {
+    if (isRelease && command === 'ready') {
+      throw new ClientError(
+        'unsupported_workflow_command',
+        'Workflow v2 uses preview-ready so it cannot be confused with Release Ready.',
+      )
+    }
+    const operationKey = isRelease
+      ? requireOperationKey(options['operation-key'])
+      : options['operation-key'] === undefined
+        ? 'preview-ready'
+        : requireOperationKey(options['operation-key'])
+    return fixedMutation(
+      operationKey,
+      'preview-ready',
+      [],
+      { workRunId: state.receipt.workRunId },
+      [isRelease ? 'preview-ready' : 'ready'],
+    )
   }
   if (command === 'stop') {
+    if (isRelease) {
+      throw new ClientError(
+        'unsupported_workflow_command',
+        'Workflow v2 release runs use cancel instead of legacy stop.',
+      )
+    }
     return fixedMutation('stop', 'stop', [], { workRunId: state.receipt.workRunId }, ['stopped'])
+  }
+  if (command === 'cancel') {
+    if (!isRelease) {
+      throw new ClientError(
+        'unsupported_workflow_command',
+        'Workflow v1 preview runs use stop instead of release cancel.',
+      )
+    }
+    return {
+      ...fixedMutation(
+        'cancel',
+        'cancel',
+        [],
+        { workRunId: state.receipt.workRunId },
+        ['canceled', 'ready'],
+      ),
+      milestoneOptional: true,
+    }
+  }
+  if (command === 'candidate-register') {
+    if (!isRelease) {
+      throw new ClientError(
+        'unsupported_workflow_command',
+        'Frozen release candidates require Workflow v2.',
+      )
+    }
+    const operationKey = requireOperationKey(options['operation-key'])
+    const outputRoot = requireBoundedText(options['output-root'], 4096, 'candidate output root')
+    const entryPath = requireBoundedText(options['entry-path'], 4096, 'candidate entry path')
+    const displayName = requireBoundedText(options['display-name'], 160, 'candidate display name')
+    const spaFallback = requireWorkflowBoolean(options['spa-fallback'], 'candidate SPA fallback')
+    return {
+      bridgeArguments: [
+        '--output-root', outputRoot,
+        '--entry-path', entryPath,
+        '--display-name', displayName,
+        '--spa-fallback', spaFallback,
+      ],
+      bridgeCommand: 'candidate-register',
+      expectedStatuses: ['freezing'],
+      input: {
+        displayName,
+        entryPath,
+        outputRoot,
+        spaFallback,
+        workRunId: state.receipt.workRunId,
+      },
+      operationKey,
+    }
+  }
+  if (isRelease) {
+    if (options.outcome !== undefined && options.outcome !== 'failed') {
+      throw new ClientError('invalid_outcome', 'Workflow v2 failure outcome must be failed.')
+    }
+    const reasonCode = requireReasonCode(options['reason-code'])
+    return fixedMutation(
+      'fail',
+      'fail',
+      ['--reason-code', reasonCode],
+      { reasonCode, workRunId: state.receipt.workRunId },
+      ['failed'],
+    )
   }
   const outcome = String(options.outcome ?? '')
   if (!terminalOutcomes.has(outcome)) throw new ClientError('invalid_outcome', 'Failure outcome must be failed or unsupported.')
@@ -288,13 +540,14 @@ async function writeManifest(tokens) {
   const { state, stateFile } = await loadState(options)
   if (!state.receipt) throw new ClientError('workflow_not_begun', 'Run key has no completed Bridge begin receipt.')
   const specPath = requireBoundedText(options.spec, 4096, 'manifest spec path')
-  const sourceStat = await stat(specPath).catch(() => undefined)
-  if (!sourceStat?.isFile() || sourceStat.size > MAXIMUM_SPEC_BYTES) {
-    throw new ClientError('invalid_manifest_spec', 'Manifest spec must be a file no larger than 1 MiB.')
-  }
+  const source = await readBoundedRegularFile(specPath, {
+    errorCode: 'invalid_manifest_spec',
+    maximumBytes: MAXIMUM_SPEC_BYTES,
+    message: 'Manifest spec must be a regular non-symlink file no larger than 1 MiB.',
+  })
   let spec
   try {
-    spec = JSON.parse(await readFile(specPath, 'utf8'))
+    spec = JSON.parse(source)
   } catch {
     throw new ClientError('invalid_manifest_spec', 'Manifest spec is not valid JSON.')
   }
@@ -371,26 +624,340 @@ function normalizeRunner(value) {
   }
 }
 
-async function readCapabilities() {
-  const traceId = `porta-skill-capabilities:${randomUUID()}`
-  const value = await runBridge(['workflow', 'capabilities', '--trace-id', traceId, '--json'])
+async function readScenePackReadinessSpec(value) {
+  if (typeof value !== 'string' || !value.trim() || value.length > 4096) {
+    throw new ClientError(
+      'invalid_scene_pack_readiness_spec',
+      'Scene Pack readiness spec path must be non-empty bounded text.',
+    )
+  }
+  const specPath = value.trim()
+  const source = await readBoundedRegularFile(specPath, {
+    errorCode: 'invalid_scene_pack_readiness_spec',
+    maximumBytes: MAXIMUM_SCENE_PACK_READINESS_SPEC_BYTES,
+    message: 'Scene Pack readiness spec must be a regular non-symlink file no larger than 24 KiB.',
+  })
+  let spec
+  try {
+    spec = JSON.parse(source)
+  } catch {
+    throw new ClientError(
+      'invalid_scene_pack_readiness_spec',
+      'Scene Pack readiness spec is not valid JSON.',
+    )
+  }
+  return normalizeScenePackReadinessObservation(
+    spec,
+    'invalid_scene_pack_readiness_spec',
+    'Scene Pack readiness spec is invalid.',
+  )
+}
+
+async function readBoundedRegularFile(path, {
+  errorCode,
+  maximumBytes,
+  message,
+}) {
+  const fail = () => {
+    throw new ClientError(errorCode, message)
+  }
+  const maximumSize = BigInt(maximumBytes)
+  const beforeOpen = await lstat(path, { bigint: true }).catch(fail)
+  if (
+    !beforeOpen?.isFile() ||
+    beforeOpen.size < 1n ||
+    beforeOpen.size > maximumSize
+  ) fail()
+
+  let handle
+  try {
+    const noFollow = typeof fsConstants.O_NOFOLLOW === 'number'
+      ? fsConstants.O_NOFOLLOW
+      : 0
+    handle = await open(path, fsConstants.O_RDONLY | noFollow)
+    const opened = await handle.stat({ bigint: true })
+    if (
+      !opened.isFile() ||
+      opened.dev !== beforeOpen.dev ||
+      opened.ino !== beforeOpen.ino ||
+      opened.size < 1n ||
+      opened.size > maximumSize
+    ) fail()
+
+    const buffer = Buffer.alloc(maximumBytes + 1)
+    let offset = 0
+    while (offset < buffer.length) {
+      const { bytesRead } = await handle.read(
+        buffer,
+        offset,
+        buffer.length - offset,
+        offset,
+      )
+      if (bytesRead === 0) break
+      offset += bytesRead
+    }
+    if (offset < 1 || offset > maximumBytes) fail()
+    return buffer.subarray(0, offset).toString('utf8')
+  } catch (error) {
+    if (error instanceof ClientError) throw error
+    fail()
+  } finally {
+    await handle?.close().catch(() => undefined)
+  }
+}
+
+function normalizeScenePackReadinessObservation(value, errorCode, errorMessage) {
+  const fail = () => {
+    throw new ClientError(errorCode, errorMessage)
+  }
   if (
     !isRecord(value) ||
+    Object.keys(value).length !== scenePackReadinessFields.length ||
+    Object.keys(value).some((key) => !scenePackReadinessFields.includes(key))
+  ) fail()
+  if (
+    typeof value.catalogId !== 'string' ||
+    !/^[a-z0-9][a-z0-9-]{0,79}$/.test(value.catalogId) ||
+    typeof value.catalogFingerprint !== 'string' ||
+    !/^[0-9a-f]{32}$/.test(value.catalogFingerprint) ||
+    !providers.has(value.provider)
+  ) fail()
+  if (
+    !Array.isArray(value.capabilities) ||
+    value.capabilities.length < 1 ||
+    value.capabilities.length > scenePackCapabilityOrder.length ||
+    new Set(value.capabilities).size !== value.capabilities.length ||
+    value.capabilities.some((capability) => !scenePackCapabilityOrder.includes(capability))
+  ) fail()
+  if (
+    !Array.isArray(value.installedSkills) ||
+    value.installedSkills.length < 1 ||
+    value.installedSkills.length > 32
+  ) fail()
+  const installedSkills = value.installedSkills.map((skill) => {
+    if (
+      !isRecord(skill) ||
+      Object.keys(skill).length !== 2 ||
+      !Object.hasOwn(skill, 'id') ||
+      !Object.hasOwn(skill, 'path') ||
+      typeof skill.id !== 'string' ||
+      !/^[a-z0-9][a-z0-9-]{0,79}$/.test(skill.id) ||
+      !isScenePackRelativePath(skill.path)
+    ) fail()
+    return { id: skill.id, path: skill.path }
+  }).sort((left, right) => left.id.localeCompare(right.id) || left.path.localeCompare(right.path))
+  if (
+    new Set(installedSkills.map((skill) => skill.id)).size !== installedSkills.length ||
+    new Set(installedSkills.map((skill) => skill.path)).size !== installedSkills.length
+  ) fail()
+  if (
+    !isRecord(value.release) ||
+    Object.keys(value.release).length !== 3 ||
+    !Object.hasOwn(value.release, 'commitSha') ||
+    !Object.hasOwn(value.release, 'tag') ||
+    !Object.hasOwn(value.release, 'version') ||
+    typeof value.release.commitSha !== 'string' ||
+    !/^[0-9a-f]{40}$/.test(value.release.commitSha) ||
+    typeof value.release.tag !== 'string' ||
+    !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,159}$/.test(value.release.tag) ||
+    typeof value.release.version !== 'string' ||
+    !strictSemverPattern.test(value.release.version)
+  ) fail()
+  const normalized = {
+    capabilities: scenePackCapabilityOrder.filter((capability) =>
+      value.capabilities.includes(capability)),
+    catalogFingerprint: value.catalogFingerprint,
+    catalogId: value.catalogId,
+    installedSkills,
+    provider: value.provider,
+    providerDiscovery: value.providerDiscovery,
+    readiness: value.readiness,
+    release: {
+      commitSha: value.release.commitSha,
+      tag: value.release.tag,
+      version: value.release.version,
+    },
+    reloadObservation: value.reloadObservation,
+  }
+  if (!isCoherentScenePackReadiness(normalized)) fail()
+  return normalized
+}
+
+function isCoherentScenePackReadiness(value) {
+  if (value.readiness === 'ready') {
+    return value.providerDiscovery === 'observed' &&
+      (value.reloadObservation === 'completed' || value.reloadObservation === 'not-required')
+  }
+  if (value.readiness === 'reload-required') {
+    return value.providerDiscovery === 'observed' && value.reloadObservation === 'required'
+  }
+  return value.readiness === 'unavailable' &&
+    value.providerDiscovery === 'missing' &&
+    value.reloadObservation === 'not-required'
+}
+
+function isScenePackRelativePath(value) {
+  if (
+    typeof value !== 'string' ||
+    value.length < 1 ||
+    value.length > 512 ||
+    value.startsWith('/') ||
+    value.endsWith('/') ||
+    value.includes('\\')
+  ) return false
+  return value.split('/').every((segment) =>
+    /^[A-Za-z0-9._-]+$/.test(segment) && segment !== '.' && segment !== '..')
+}
+
+function scenePackReadinessIdempotencyKey(observation) {
+  return `porta-skill-scene-readiness:${hashJson(observation)}`
+}
+
+async function readScenePackReadinessCapabilities() {
+  const traceId = `porta-skill-scene-readiness-capabilities:${randomUUID()}`
+  const value = await runBridge([
+    'workflow',
+    'capabilities',
+    '--trace-id', traceId,
+    '--json',
+  ])
+  const compatible =
+    isRecord(value) &&
+    value.ok === true &&
+    value.type === 'workflow-capabilities' &&
+    value.protocolVersion === 1 &&
+    value.workflowProtocolVersion === LEGACY_WORKFLOW_PROTOCOL_VERSION &&
+    value.traceId === traceId &&
+    isRuntimeAtLeast(value.runtimeVersion, MINIMUM_SCENE_PACK_READINESS_RUNTIME) &&
+    Array.isArray(value.commands) &&
+    value.commands.includes('scene-pack-readiness-observe')
+  if (!compatible) {
+    throw new ClientError(
+      'workflow_incompatible',
+      'Agent Bridge Runtime 1.16.1 or newer with Scene Pack readiness support is required.',
+    )
+  }
+  return value
+}
+
+function validateScenePackReadinessReceipt(value, observation, traceId) {
+  const receiptFields = [
+    ...scenePackReadinessFields,
+    'cursor',
+    'idempotent',
+    'observedAt',
+    'ok',
+    'protocolVersion',
+    'traceId',
+    'type',
+    'workflowProtocolVersion',
+  ]
+  if (
+    !isRecord(value) ||
+    Object.keys(value).length !== receiptFields.length ||
+    Object.keys(value).some((key) => !receiptFields.includes(key)) ||
+    typeof value.cursor !== 'string' ||
+    !/^\d{1,40}$/.test(value.cursor) ||
+    BigInt(value.cursor) < 1n ||
+    typeof value.idempotent !== 'boolean' ||
+    !isIsoDateTime(value.observedAt) ||
     value.ok !== true ||
-    value.type !== 'workflow-capabilities' ||
     value.protocolVersion !== 1 ||
-    value.workflowProtocolVersion !== 1 ||
     value.traceId !== traceId ||
-    !isRuntimeAtLeast(value.runtimeVersion, MINIMUM_WORKFLOW_RUNTIME) ||
-    !Array.isArray(value.commands) ||
-    ['attention', 'begin', 'fail', 'preview-ready', 'preview-start', 'progress', 'stop'].some((command) => !value.commands.includes(command)) ||
-    !Array.isArray(value.artifactKinds) ||
-    !['web', 'android-apk'].every((kind) => value.artifactKinds.includes(kind))
+    value.type !== 'workflow-scene-pack-readiness-receipt' ||
+    value.workflowProtocolVersion !== LEGACY_WORKFLOW_PROTOCOL_VERSION
   ) {
-    throw new ClientError('workflow_incompatible', 'Agent Bridge does not expose the required Workflow v1 contract.')
+    throw new ClientError(
+      'malformed_bridge_receipt',
+      'Agent Bridge returned an invalid Scene Pack readiness receipt.',
+    )
+  }
+  const receiptObservation = normalizeScenePackReadinessObservation(
+    Object.fromEntries(scenePackReadinessFields.map((key) => [key, value[key]])),
+    'malformed_bridge_receipt',
+    'Agent Bridge returned an invalid Scene Pack readiness receipt.',
+  )
+  if (JSON.stringify(receiptObservation) !== JSON.stringify(observation)) {
+    throw new ClientError(
+      'malformed_bridge_receipt',
+      'Agent Bridge Scene Pack readiness receipt did not echo the exact observation.',
+    )
+  }
+  return {
+    ...receiptObservation,
+    cursor: String(value.cursor),
+    idempotent: value.idempotent,
+    observedAt: value.observedAt,
+    ok: true,
+    protocolVersion: 1,
+    traceId,
+    type: 'workflow-scene-pack-readiness-receipt',
+    workflowProtocolVersion: LEGACY_WORKFLOW_PROTOCOL_VERSION,
+  }
+}
+
+async function readCapabilities(workflowProtocolVersion = LEGACY_WORKFLOW_PROTOCOL_VERSION) {
+  const traceId = `porta-skill-capabilities:${randomUUID()}`
+  const value = await runBridge([
+    'workflow',
+    'capabilities',
+    ...(workflowProtocolVersion === RELEASE_WORKFLOW_PROTOCOL_VERSION
+      ? ['--workflow-protocol-version', String(workflowProtocolVersion)]
+      : []),
+    '--trace-id', traceId,
+    '--json',
+  ])
+  const commonValid =
+    isRecord(value) &&
+    value.ok === true &&
+    value.type === 'workflow-capabilities' &&
+    value.protocolVersion === 1 &&
+    value.workflowProtocolVersion === workflowProtocolVersion &&
+    value.traceId === traceId &&
+    Array.isArray(value.commands)
+  const contractValid = workflowProtocolVersion === RELEASE_WORKFLOW_PROTOCOL_VERSION
+    ? commonValid &&
+      value.eventContractVersion === RELEASE_WORKFLOW_PROTOCOL_VERSION &&
+      isRuntimeAtLeast(value.runtimeVersion, MINIMUM_RELEASE_WORKFLOW_RUNTIME) &&
+      [
+        'attention',
+        'begin',
+        'cancel',
+        'candidate-register',
+        'fail',
+        'preview-ready',
+        'preview-start',
+        'progress',
+      ].every((command) => value.commands.includes(command)) &&
+      Array.isArray(value.capabilities) &&
+      ['static-html-release', 'porta.workflow.event-loop.v2']
+        .every((capability) => value.capabilities.includes(capability))
+    : commonValid &&
+      isRuntimeAtLeast(value.runtimeVersion, MINIMUM_LEGACY_WORKFLOW_RUNTIME) &&
+      [
+        'attention',
+        'begin',
+        'fail',
+        'preview-ready',
+        'preview-start',
+        'progress',
+        'stop',
+      ].every((command) => value.commands.includes(command)) &&
+      Array.isArray(value.artifactKinds) &&
+      ['web', 'android-apk'].every((kind) => value.artifactKinds.includes(kind))
+  if (!contractValid) {
+    throw new ClientError(
+      'workflow_incompatible',
+      `Agent Bridge does not expose the required Workflow v${workflowProtocolVersion} contract.`,
+    )
   }
   if (value.platformSupported !== true) {
-    throw new ClientError('unsupported_platform', 'Agent Bridge reports Product Preview unsupported on this platform.')
+    throw new ClientError(
+      'unsupported_platform',
+      workflowProtocolVersion === RELEASE_WORKFLOW_PROTOCOL_VERSION
+        ? 'Agent Bridge reports Static HTML Product Release unsupported on this platform.'
+        : 'Agent Bridge reports Product Preview unsupported on this platform.',
+    )
   }
   return value
 }
@@ -440,6 +1007,11 @@ function parseOptionalBridgeJson(source) {
 }
 
 function validateBeginReceipt(value, state) {
+  if (!isRecord(value)) {
+    throw new ClientError('malformed_bridge_receipt', 'Agent Bridge returned an invalid begin receipt.')
+  }
+  const workflowProtocolVersion = workflowProtocolVersionForState(state)
+  const isRelease = workflowProtocolVersion === RELEASE_WORKFLOW_PROTOCOL_VERSION
   const receipt = requireExactRecord(value, [
     'created',
     'eventContractVersion',
@@ -448,6 +1020,8 @@ function validateBeginReceipt(value, state) {
     'milestoneCursor',
     'ok',
     'protocolVersion',
+    'provider',
+    'publishIntent',
     'requestId',
     'skillId',
     'skillVersion',
@@ -457,7 +1031,7 @@ function validateBeginReceipt(value, state) {
     'type',
     'workflowProtocolVersion',
     'workRunId',
-  ], [], 'begin receipt')
+  ], isRelease ? [] : ['provider', 'publishIntent'], 'begin receipt')
   const requestId = requireUuid(receipt.requestId, 'request id')
   const expectedManifestPath = join(state.cwd, '.porta', 'previews', `${requestId}.json`)
   const expectedLogPath = join(state.cwd, '.porta', 'previews', `${requestId}.log`)
@@ -465,11 +1039,12 @@ function validateBeginReceipt(value, state) {
     receipt.ok !== true ||
     receipt.type !== 'workflow-begin' ||
     receipt.protocolVersion !== 1 ||
-    receipt.workflowProtocolVersion !== 1 ||
-    receipt.eventContractVersion !== EVENT_CONTRACT_VERSION ||
+    receipt.workflowProtocolVersion !== workflowProtocolVersion ||
+    receipt.eventContractVersion !== workflowProtocolVersion ||
     receipt.skillId !== SKILL_ID ||
-    receipt.skillVersion !== SKILL_VERSION ||
-    receipt.status !== 'active' ||
+    receipt.skillVersion !== state.skillVersion ||
+    receipt.status !== (isRelease ? 'implementing' : 'active') ||
+    (!isRelease && (receipt.provider !== undefined || receipt.publishIntent !== undefined)) ||
     receipt.manifestPath !== expectedManifestPath ||
     receipt.logPath !== expectedLogPath ||
     !workflowRunPattern.test(String(receipt.workRunId ?? '')) ||
@@ -477,6 +1052,17 @@ function validateBeginReceipt(value, state) {
     receipt.sourceSequence < 1
   ) {
     throw new ClientError('malformed_bridge_receipt', 'Agent Bridge returned an invalid begin receipt.')
+  }
+  if (isRelease) {
+    if (
+      receipt.provider !== state.provider ||
+      !isWorkflowV2PublishIntent(receipt.publishIntent)
+    ) {
+      throw new ClientError(
+        'malformed_bridge_receipt',
+        'Agent Bridge returned an invalid Workflow v2 Publish Intent receipt.',
+      )
+    }
   }
   requireUuid(receipt.traceId, 'trace id')
   requirePositiveCursor(receipt.milestoneCursor, 'milestone cursor')
@@ -487,6 +1073,7 @@ function validateBeginReceipt(value, state) {
 }
 
 function validateMutationReceipt(value, beginReceipt, mutation) {
+  const workflowProtocolVersion = beginReceipt.workflowProtocolVersion
   const receipt = requireExactRecord(value, [
     'command',
     'idempotent',
@@ -499,12 +1086,14 @@ function validateMutationReceipt(value, beginReceipt, mutation) {
     'type',
     'workflowProtocolVersion',
     'workRunId',
-  ], mutation.bridgeCommand === 'progress' ? ['milestoneCursor'] : [], 'workflow receipt')
+  ], mutation.bridgeCommand === 'progress' || mutation.milestoneOptional
+    ? ['milestoneCursor']
+    : [], 'workflow receipt')
   if (
     receipt.ok !== true ||
     receipt.type !== 'workflow-receipt' ||
     receipt.protocolVersion !== 1 ||
-    receipt.workflowProtocolVersion !== 1 ||
+    receipt.workflowProtocolVersion !== workflowProtocolVersion ||
     receipt.command !== mutation.bridgeCommand ||
     receipt.workRunId !== beginReceipt.workRunId ||
     receipt.traceId !== beginReceipt.traceId ||
@@ -517,6 +1106,188 @@ function validateMutationReceipt(value, beginReceipt, mutation) {
   }
   if (receipt.milestoneCursor !== undefined) requirePositiveCursor(receipt.milestoneCursor, 'milestone cursor')
   return receipt
+}
+
+function validateReleaseStatusBatch(value, state, traceId) {
+  const batch = requireExactRecord(value, [
+    'cursor',
+    'events',
+    'protocolVersion',
+    'runs',
+    'traceId',
+    'type',
+    'workflowProtocolVersion',
+  ], [], 'Workflow v2 pull batch')
+  if (
+    batch.protocolVersion !== 1 ||
+    batch.workflowProtocolVersion !== RELEASE_WORKFLOW_PROTOCOL_VERSION ||
+    batch.type !== 'workflow-pull' ||
+    batch.traceId !== traceId ||
+    !isNonNegativeCursor(batch.cursor) ||
+    !Array.isArray(batch.events) ||
+    !Array.isArray(batch.runs)
+  ) {
+    throw new ClientError(
+      'malformed_bridge_receipt',
+      'Agent Bridge returned an invalid Workflow v2 pull batch.',
+    )
+  }
+  const matches = batch.runs.filter((run) =>
+    isRecord(run) && run.workRunId === state.receipt.workRunId,
+  )
+  if (matches.length !== 1) {
+    throw new ClientError(
+      'work_run_not_found',
+      'Agent Bridge did not return the exact Workflow v2 WorkRun.',
+    )
+  }
+  return normalizeReleaseStatusRun(matches[0], state)
+}
+
+function normalizeReleaseStatusRun(value, state) {
+  const statuses = new Set([
+    'canceled',
+    'failed',
+    'freezing',
+    'implementing',
+    'preview-ready',
+    'ready',
+    'transferring',
+    'verifying',
+  ])
+  if (
+    value.workflowProtocolVersion !== RELEASE_WORKFLOW_PROTOCOL_VERSION ||
+    value.eventContractVersion !== RELEASE_WORKFLOW_PROTOCOL_VERSION ||
+    value.workRunId !== state.receipt.workRunId ||
+    value.requestId !== state.receipt.requestId ||
+    value.traceId !== state.receipt.traceId ||
+    value.skillId !== SKILL_ID ||
+    value.skillVersion !== state.skillVersion ||
+    value.provider !== state.provider ||
+    value.cwd !== state.cwd ||
+    value.manifestPath !== state.receipt.manifestPath ||
+    value.logPath !== state.receipt.logPath ||
+    JSON.stringify(value.publishIntent) !== JSON.stringify(state.receipt.publishIntent) ||
+    typeof value.attentionRequired !== 'boolean' ||
+    !Number.isSafeInteger(value.sourceSequence) ||
+    value.sourceSequence < state.receipt.sourceSequence ||
+    !statuses.has(value.status) ||
+    !isIsoDateTime(value.updatedAt)
+  ) {
+    throw new ClientError(
+      'malformed_bridge_receipt',
+      'Agent Bridge returned an invalid Workflow v2 WorkRun snapshot.',
+    )
+  }
+  const candidate = value.candidate === undefined
+    ? undefined
+    : normalizeReleaseCandidateSummary(value.candidate)
+  const release = value.release === undefined
+    ? undefined
+    : normalizeReleaseSummary(value.release)
+  const progress = value.progress === undefined
+    ? undefined
+    : normalizeReleaseProgress(value.progress)
+  const terminalAt = value.terminalAt === undefined
+    ? undefined
+    : requireIsoDateTime(value.terminalAt, 'Workflow terminal time')
+  const terminal = ['canceled', 'failed', 'ready'].includes(value.status)
+  if (
+    (['freezing', 'transferring', 'verifying', 'ready'].includes(value.status) && !candidate) ||
+    (['transferring', 'verifying', 'ready'].includes(value.status) && !release) ||
+    (value.status === 'ready' && !release?.revisionRef) ||
+    (terminal !== Boolean(terminalAt))
+  ) {
+    throw new ClientError(
+      'malformed_bridge_receipt',
+      'Agent Bridge returned an inconsistent Workflow v2 WorkRun snapshot.',
+    )
+  }
+  return {
+    attentionRequired: value.attentionRequired,
+    ...(candidate ? { candidate } : {}),
+    ...(progress ? { progress } : {}),
+    ...(release ? { release } : {}),
+    sourceSequence: value.sourceSequence,
+    status: value.status,
+    ...(terminalAt ? { terminalAt } : {}),
+    updatedAt: value.updatedAt,
+    workRunId: value.workRunId,
+  }
+}
+
+function normalizeReleaseCandidateSummary(value) {
+  const candidate = requireExactRecord(value, [
+    'candidateDigest',
+    'candidateRef',
+    'registeredAt',
+    'replacedCandidateRef',
+  ], ['replacedCandidateRef'], 'Workflow v2 candidate summary')
+  if (
+    !/^[a-f0-9]{64}$/.test(String(candidate.candidateDigest ?? '')) ||
+    !isWorkflowOpaqueRef(candidate.candidateRef) ||
+    !isIsoDateTime(candidate.registeredAt) ||
+    (candidate.replacedCandidateRef !== undefined && (
+      !isWorkflowOpaqueRef(candidate.replacedCandidateRef) ||
+      candidate.replacedCandidateRef === candidate.candidateRef
+    ))
+  ) {
+    throw new ClientError(
+      'malformed_bridge_receipt',
+      'Agent Bridge returned an invalid Workflow v2 candidate summary.',
+    )
+  }
+  return candidate
+}
+
+function normalizeReleaseSummary(value) {
+  const release = requireExactRecord(value, [
+    'attemptRef',
+    'productRef',
+    'releaseRef',
+    'revisionRef',
+  ], ['revisionRef'], 'Workflow v2 release summary')
+  if (
+    !isWorkflowOpaqueRef(release.attemptRef) ||
+    !isWorkflowOpaqueRef(release.productRef) ||
+    !isWorkflowOpaqueRef(release.releaseRef) ||
+    (release.revisionRef !== undefined && !isWorkflowOpaqueRef(release.revisionRef))
+  ) {
+    throw new ClientError(
+      'malformed_bridge_receipt',
+      'Agent Bridge returned an invalid Workflow v2 release summary.',
+    )
+  }
+  return release
+}
+
+function normalizeReleaseProgress(value) {
+  const progress = requireExactRecord(value, [
+    'percent',
+    'phase',
+    'summary',
+    'updatedAt',
+  ], ['percent', 'summary'], 'Workflow v2 progress')
+  if (
+    !releaseProgressPhases.has(progress.phase) ||
+    (progress.percent !== undefined && (
+      !Number.isSafeInteger(progress.percent) ||
+      progress.percent < 0 ||
+      progress.percent > 100
+    )) ||
+    (progress.summary !== undefined && (
+      typeof progress.summary !== 'string' ||
+      progress.summary.length < 1 ||
+      progress.summary.length > 240
+    )) ||
+    !isIsoDateTime(progress.updatedAt)
+  ) {
+    throw new ClientError(
+      'malformed_bridge_receipt',
+      'Agent Bridge returned an invalid Workflow v2 progress snapshot.',
+    )
+  }
+  return progress
 }
 
 async function loadState(options) {
@@ -606,11 +1377,23 @@ function validateState(value) {
     'skillId',
     'skillVersion',
     'version',
-  ], ['latestReceipt', 'providerSessionId', 'receipt'], 'client state')
+    'workflowProtocolVersion',
+  ], [
+    'latestReceipt',
+    'providerSessionId',
+    'receipt',
+    'workflowProtocolVersion',
+  ], 'client state')
+  const workflowProtocolVersion = workflowProtocolVersionForState(state)
+  const skillVersionValid = state.skillVersion === SKILL_VERSION ||
+    (
+      workflowProtocolVersion === LEGACY_WORKFLOW_PROTOCOL_VERSION &&
+      RESUMABLE_LEGACY_SKILL_VERSIONS.has(state.skillVersion)
+    )
   if (
     state.version !== CLIENT_STATE_VERSION ||
     state.skillId !== SKILL_ID ||
-    state.skillVersion !== SKILL_VERSION ||
+    !skillVersionValid ||
     !runKeyPattern.test(String(state.runKey ?? '')) ||
     !providers.has(state.provider) ||
     typeof state.cwd !== 'string' ||
@@ -622,6 +1405,17 @@ function validateState(value) {
   }
   if (state.providerSessionId !== undefined) requireBoundedText(state.providerSessionId, 256, 'provider session id')
   const completedReceipts = []
+  const allowedOperationCommands = workflowProtocolVersion === RELEASE_WORKFLOW_PROTOCOL_VERSION
+    ? new Set([
+      'attention',
+      'cancel',
+      'candidate-register',
+      'fail',
+      'preview-ready',
+      'preview-start',
+      'progress',
+    ])
+    : new Set(['attention', 'fail', 'preview-ready', 'preview-start', 'progress', 'stop'])
   for (const [operationKey, operationValue] of Object.entries(state.operations)) {
     requireOperationKey(operationKey)
     const operation = requireExactRecord(operationValue, ['command', 'createdAt', 'idempotencyKey', 'inputHash', 'receipt'], ['receipt'], 'client operation')
@@ -630,7 +1424,7 @@ function validateState(value) {
       !isIsoDateTime(operation.createdAt) ||
       !/^porta-skill-op:[a-f0-9]{64}$/.test(String(operation.idempotencyKey ?? '')) ||
       !/^[a-f0-9]{64}$/.test(String(operation.inputHash ?? '')) ||
-      !['attention', 'fail', 'preview-ready', 'preview-start', 'progress', 'stop'].includes(operation.command) ||
+      !allowedOperationCommands.has(operation.command) ||
       (operation.receipt !== undefined && !isRecord(operation.receipt))
     ) throw new ClientError('invalid_client_state', 'Client operation failed validation.')
   }
@@ -640,7 +1434,8 @@ function validateState(value) {
     if (!beginReceipt) throw new ClientError('invalid_client_state', 'Completed operation has no begin receipt.')
     const receipt = validateMutationReceipt(operation.receipt, beginReceipt, {
       bridgeCommand: operation.command,
-      expectedStatuses: storedExpectedStatuses(operation.command),
+      expectedStatuses: storedExpectedStatuses(operation.command, workflowProtocolVersion),
+      milestoneOptional: storedMilestoneOptional(operation.command, workflowProtocolVersion),
     })
     completedReceipts.push(receipt)
   }
@@ -653,13 +1448,40 @@ function validateState(value) {
   return state
 }
 
-function storedExpectedStatuses(command) {
+function storedExpectedStatuses(command, workflowProtocolVersion) {
+  if (workflowProtocolVersion === RELEASE_WORKFLOW_PROTOCOL_VERSION) {
+    if (command === 'progress' || command === 'attention') {
+      return ['freezing', 'implementing', 'preview-ready', 'transferring', 'verifying']
+    }
+    if (command === 'preview-start') return ['implementing']
+    if (command === 'preview-ready') return ['preview-ready']
+    if (command === 'candidate-register') return ['freezing']
+    if (command === 'cancel') return ['canceled', 'ready']
+    if (command === 'fail') return ['failed']
+    throw new ClientError('invalid_client_state', 'Stored Workflow v2 operation command is invalid.')
+  }
   if (command === 'progress' || command === 'attention') return ['active', 'building']
   if (command === 'preview-start') return ['building']
   if (command === 'preview-ready') return ['ready']
   if (command === 'stop') return ['stopped']
   if (command === 'fail') return ['failed', 'unsupported']
   throw new ClientError('invalid_client_state', 'Stored operation command is invalid.')
+}
+
+function storedMilestoneOptional(command, workflowProtocolVersion) {
+  return workflowProtocolVersion === RELEASE_WORKFLOW_PROTOCOL_VERSION &&
+    ['attention', 'cancel'].includes(command)
+}
+
+function workflowProtocolVersionForState(state) {
+  const value = state.workflowProtocolVersion ?? LEGACY_WORKFLOW_PROTOCOL_VERSION
+  if (
+    value !== LEGACY_WORKFLOW_PROTOCOL_VERSION &&
+    value !== RELEASE_WORKFLOW_PROTOCOL_VERSION
+  ) {
+    throw new ClientError('invalid_client_state', 'Client state Workflow protocol version is invalid.')
+  }
+  return value
 }
 
 async function writeState(path, state) {
@@ -739,6 +1561,19 @@ function requireProvider(value) {
   return normalized
 }
 
+function requireWorkflowProtocolVersion(value) {
+  if (value === undefined) return LEGACY_WORKFLOW_PROTOCOL_VERSION
+  if (value !== '1' && value !== '2') {
+    throw new ClientError('invalid_workflow_version', 'Workflow protocol version must be 1 or 2.')
+  }
+  return Number(value)
+}
+
+function requireWorkflowBoolean(value, label) {
+  if (value === '0' || value === '1') return value
+  throw new ClientError('invalid_arguments', `${label} must be 0 or 1.`)
+}
+
 function requireReasonCode(value) {
   const normalized = String(value ?? '')
   if (!reasonCodePattern.test(normalized)) throw new ClientError('invalid_reason_code', 'Reason code is invalid.')
@@ -782,6 +1617,10 @@ function requirePositiveCursor(value, label) {
   }
 }
 
+function isNonNegativeCursor(value) {
+  return /^\d+$/.test(String(value ?? '')) && BigInt(value) >= 0n
+}
+
 function requireIsoDateTime(value, label) {
   const normalized = String(value ?? '')
   if (!isIsoDateTime(normalized)) throw new ClientError('invalid_arguments', `${label} must be an ISO date-time.`)
@@ -792,6 +1631,24 @@ function isIsoDateTime(value) {
   return typeof value === 'string' &&
     /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(value) &&
     !Number.isNaN(Date.parse(value))
+}
+
+function isWorkflowV2PublishIntent(value) {
+  return isRecord(value) &&
+    Object.keys(value).length === 4 &&
+    Object.hasOwn(value, 'issuedAt') &&
+    Object.hasOwn(value, 'projectContextGeneration') &&
+    Object.hasOwn(value, 'projectRef') &&
+    Object.hasOwn(value, 'ref') &&
+    isIsoDateTime(value.issuedAt) &&
+    Number.isSafeInteger(value.projectContextGeneration) &&
+    value.projectContextGeneration > 0 &&
+    /^project_[A-Za-z0-9-]{4,152}$/.test(String(value.projectRef ?? '')) &&
+    /^[A-Za-z0-9][A-Za-z0-9._:-]{7,159}$/.test(String(value.ref ?? ''))
+}
+
+function isWorkflowOpaqueRef(value) {
+  return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{7,159}$/.test(value)
 }
 
 function isRuntimeAtLeast(value, minimum) {

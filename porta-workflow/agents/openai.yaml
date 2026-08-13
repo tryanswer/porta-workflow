@@ -1,7 +1,7 @@
 interface:
   display_name: "Porta Workflow"
-  short_description: "Run verified Porta product-preview workflows"
-  default_prompt: "Use $porta-workflow to build this project and publish a verified preview to Porta."
+  short_description: "Build and publish a verified static Porta product"
+  default_prompt: "Build this project and publish one verified Static HTML Product through Porta."
 
 policy:
-  allow_implicit_invocation: false
+  allow_implicit_invocation: true

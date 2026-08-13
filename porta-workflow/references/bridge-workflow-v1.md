@@ -35,7 +35,7 @@ node "$CLIENT" begin \
 ## Lifecycle
 
 1. Preflight capabilities before changing the project.
-2. Begin one WorkRun for one explicit user invocation.
+2. Begin one WorkRun for one current-message request that explicitly names Porta Product Preview.
 3. Inspect and implement using the repository's own architecture and commands.
 4. Emit progress only at meaningful phase changes.
 5. Start Preview monitoring when artifact preparation begins.
@@ -142,7 +142,7 @@ Write complete command output to the Bridge-issued `logPath` using the project's
 - Unknown mutation result: reuse the same operation key with identical input.
 - `preview_busy`: keep the current WorkRun and operation key. Ask the user to stop the existing Preview in Porta, then retry; never replace it by cwd or recency.
 - `manifest_missing` or `manifest_invalid`: fix the exact manifest, then retry the same Ready/Fail command.
-- `work_run_not_found`: the retained WorkRun has expired or disappeared. Report that fact; create a new Run key only if the user still explicitly requests a new Workflow.
+- `work_run_not_found`: the retained WorkRun has expired or disappeared. Report that fact; create a new Run key only if the user still explicitly requests a new Porta Product Preview.
 - Preview process cannot survive Agent exit: write a failed manifest and call `fail --outcome failed --reason-code preview_process_failed`. Do not emit Ready for a listener that will be reclaimed with the current tool session.
 - User stop: call `stop` for the exact Run key. Interrupt a process only when this invocation recorded its exact ownership; otherwise report that monitoring stopped without claiming the process exited.
 - Failed/unsupported terminal: write the matching terminal manifest first. If the manifest cannot be written or validated, report that the terminal event was not accepted.

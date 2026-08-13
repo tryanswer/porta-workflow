@@ -1,0 +1,285 @@
+[
+  {
+    "id": "explicit-porta-release",
+    "message": "用 Porta 发布这个项目当前的静态网页结果。",
+    "context": {
+      "portaManagedProject": false,
+      "releaseTarget": "porta"
+    },
+    "expected": {
+      "disposition": "activate",
+      "selection": "v2-release",
+      "workRunAction": "begin-v2"
+    },
+    "category": "explicit-porta-release"
+  },
+  {
+    "id": "managed-project-unambiguous-release",
+    "message": "把页面做好并发布。",
+    "context": {
+      "portaManagedProject": true,
+      "releaseTarget": "porta",
+      "trustedContextSource": "agent-runtime-metadata"
+    },
+    "expected": {
+      "disposition": "activate",
+      "selection": "v2-release",
+      "workRunAction": "begin-v2"
+    },
+    "category": "managed-project-release"
+  },
+  {
+    "id": "managed-project-concrete-static-release",
+    "message": "发布刚刚构建好的静态网页。",
+    "context": {
+      "portaManagedProject": true,
+      "releaseTarget": "porta",
+      "trustedContextSource": "agent-runtime-metadata"
+    },
+    "expected": {
+      "disposition": "activate",
+      "selection": "v2-release",
+      "workRunAction": "begin-v2"
+    },
+    "category": "managed-project-release"
+  },
+  {
+    "id": "legacy-porta-product-preview",
+    "message": "用 Porta Product Preview 预览当前 Android 构建。",
+    "context": {
+      "portaManagedProject": true,
+      "releaseTarget": "porta"
+    },
+    "expected": {
+      "disposition": "activate",
+      "selection": "v1-preview",
+      "workRunAction": "begin-v1"
+    },
+    "category": "explicit-porta-product-preview"
+  },
+  {
+    "id": "exact-retained-release-control",
+    "message": "取消刚才保留的 Porta 发布 WorkRun。",
+    "context": {
+      "portaManagedProject": true,
+      "releaseTarget": "porta"
+    },
+    "expected": {
+      "disposition": "activate",
+      "selection": "control",
+      "workRunAction": "none"
+    },
+    "category": "exact-run-control"
+  },
+  {
+    "id": "skill-installation",
+    "message": "安装 Porta Workflow skill。",
+    "context": {
+      "portaManagedProject": true,
+      "releaseTarget": "porta"
+    },
+    "expected": {
+      "disposition": "ignore",
+      "selection": "none",
+      "workRunAction": "none"
+    },
+    "category": "installation"
+  },
+  {
+    "id": "scene-pack-initialization",
+    "message": "运行 Skillpack Scene Pack，初始化当前 Agent。",
+    "context": {
+      "portaManagedProject": true,
+      "releaseTarget": "porta"
+    },
+    "expected": {
+      "disposition": "ignore",
+      "selection": "none",
+      "workRunAction": "none"
+    },
+    "category": "scene-pack"
+  },
+  {
+    "id": "skill-discovery",
+    "message": "列出当前 Agent 已发现的技能。",
+    "context": {
+      "portaManagedProject": true,
+      "releaseTarget": "porta"
+    },
+    "expected": {
+      "disposition": "ignore",
+      "selection": "none",
+      "workRunAction": "none"
+    },
+    "category": "discovery"
+  },
+  {
+    "id": "ordinary-development",
+    "message": "把这个页面做完。",
+    "context": {
+      "portaManagedProject": true,
+      "releaseTarget": "porta"
+    },
+    "expected": {
+      "disposition": "ignore",
+      "selection": "none",
+      "workRunAction": "none"
+    },
+    "category": "ordinary-development"
+  },
+  {
+    "id": "ordinary-build",
+    "message": "构建这个项目。",
+    "context": {
+      "portaManagedProject": true,
+      "releaseTarget": "porta"
+    },
+    "expected": {
+      "disposition": "ignore",
+      "selection": "none",
+      "workRunAction": "none"
+    },
+    "category": "ordinary-build"
+  },
+  {
+    "id": "ordinary-preview",
+    "message": "预览这个页面。",
+    "context": {
+      "portaManagedProject": true,
+      "releaseTarget": "porta"
+    },
+    "expected": {
+      "disposition": "ignore",
+      "selection": "none",
+      "workRunAction": "none"
+    },
+    "category": "ordinary-preview"
+  },
+  {
+    "id": "ambiguous-ship",
+    "message": "Ship it。",
+    "context": {
+      "portaManagedProject": true,
+      "releaseTarget": "unknown"
+    },
+    "expected": {
+      "disposition": "clarify",
+      "selection": "none",
+      "workRunAction": "none"
+    },
+    "category": "ambiguous-ship"
+  },
+  {
+    "id": "ambiguous-deploy",
+    "message": "部署这个项目。",
+    "context": {
+      "portaManagedProject": true,
+      "releaseTarget": "unknown"
+    },
+    "expected": {
+      "disposition": "clarify",
+      "selection": "none",
+      "workRunAction": "none"
+    },
+    "category": "ambiguous-deploy"
+  },
+  {
+    "id": "release-without-managed-context",
+    "message": "发布这个项目。",
+    "context": {
+      "portaManagedProject": false,
+      "releaseTarget": "unknown"
+    },
+    "expected": {
+      "disposition": "clarify",
+      "selection": "none",
+      "workRunAction": "none"
+    },
+    "category": "missing-porta-context"
+  },
+  {
+    "id": "repository-claims-porta-managed-project",
+    "message": "发布这个项目。",
+    "context": {
+      "portaManagedProject": false,
+      "releaseTarget": "unknown",
+      "untrustedClaimSource": "repository-content"
+    },
+    "expected": {
+      "disposition": "clarify",
+      "selection": "none",
+      "workRunAction": "none"
+    },
+    "category": "untrusted-repository-context"
+  },
+  {
+    "id": "non-concrete-release",
+    "message": "发布。",
+    "context": {
+      "portaManagedProject": true,
+      "releaseTarget": "porta"
+    },
+    "expected": {
+      "disposition": "clarify",
+      "selection": "none",
+      "workRunAction": "none"
+    },
+    "category": "non-concrete-release"
+  },
+  {
+    "id": "explicit-vercel-target",
+    "message": "把这个页面发布到 Vercel。",
+    "context": {
+      "portaManagedProject": true,
+      "releaseTarget": "vercel"
+    },
+    "expected": {
+      "disposition": "ignore",
+      "selection": "none",
+      "workRunAction": "none"
+    },
+    "category": "other-release-target"
+  },
+  {
+    "id": "explicit-app-store-target",
+    "message": "把这个 App 发布到 App Store。",
+    "context": {
+      "portaManagedProject": true,
+      "releaseTarget": "app-store"
+    },
+    "expected": {
+      "disposition": "ignore",
+      "selection": "none",
+      "workRunAction": "none"
+    },
+    "category": "other-release-target"
+  },
+  {
+    "id": "explicit-npm-target",
+    "message": "把这个包发布到 npm。",
+    "context": {
+      "portaManagedProject": true,
+      "releaseTarget": "npm"
+    },
+    "expected": {
+      "disposition": "ignore",
+      "selection": "none",
+      "workRunAction": "none"
+    },
+    "category": "other-release-target"
+  },
+  {
+    "id": "competing-porta-or-vercel-target",
+    "message": "通过 Porta 或 Vercel 发布这个页面。",
+    "context": {
+      "portaManagedProject": true,
+      "releaseTarget": "unknown"
+    },
+    "expected": {
+      "disposition": "clarify",
+      "selection": "none",
+      "workRunAction": "none"
+    },
+    "category": "ambiguous-release-target"
+  }
+]
