@@ -8,6 +8,8 @@ const openaiMetadataPath = fileURLToPath(new URL('../agents/openai.yaml', import
 const activationCasesPath = fileURLToPath(new URL('../evals/activation-cases.json', import.meta.url))
 const releaseReferencePath = fileURLToPath(new URL('../references/bridge-workflow-v2.md', import.meta.url))
 const legacyReferencePath = fileURLToPath(new URL('../references/bridge-workflow-v1.md', import.meta.url))
+const clientPath = fileURLToPath(new URL('../scripts/porta-workflow.mjs', import.meta.url))
+const readmePath = fileURLToPath(new URL('../../README.md', import.meta.url))
 
 function readFrontmatterDescription(skill) {
   const match = skill.match(/^---\n[\s\S]*?^description:\s*(.+)\n[\s\S]*?^---$/m)
@@ -20,6 +22,21 @@ function readQuotedYamlValue(source, key) {
   assert.ok(match, `agents/openai.yaml must contain quoted ${key}`)
   return match[1]
 }
+
+test('public release tag stays bound to the client skill version', async () => {
+  const [client, readme, releaseReference] = await Promise.all([
+    readFile(clientPath, 'utf8'),
+    readFile(readmePath, 'utf8'),
+    readFile(releaseReferencePath, 'utf8'),
+  ])
+  const skillVersion = client.match(/^const SKILL_VERSION = '([^']+)'$/m)?.[1]
+  assert.ok(skillVersion, 'client must declare SKILL_VERSION')
+  const expectedTag = `porta-workflow-v${skillVersion}`
+
+  assert.match(readme, new RegExp(`git clone --branch ${expectedTag.replaceAll('.', '\\.')} `))
+  assert.match(releaseReference, new RegExp(`"tag": "${expectedTag.replaceAll('.', '\\.')}"`))
+  assert.match(releaseReference, new RegExp(`"version": "${skillVersion.replaceAll('.', '\\.')}"`))
+})
 
 test('natural-language activation metadata selects only unambiguous Porta publication intent', async () => {
   const [skill, metadata] = await Promise.all([
